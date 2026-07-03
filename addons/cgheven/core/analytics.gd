@@ -36,6 +36,7 @@ func track(event: String, props := {}) -> void:
 		"is_premium": _is_premium(),
 		"is_guest": _email == "",
 		"account_email": _email,
+		"install_source": CghConfig.install_source(),
 	}
 	for k in props:
 		properties[k] = props[k]

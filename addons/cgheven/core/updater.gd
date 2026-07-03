@@ -28,22 +28,15 @@ func check() -> void:
 		"addon_slug": CghConfig.ADDON_SLUG,
 		"current_version": CghConfig.ADDON_VERSION,
 	})
-	print("[CGHEVEN update] POST %s  slug=%s current_version=%s" % [
-		CghConfig.check_update_url(), CghConfig.ADDON_SLUG, CghConfig.ADDON_VERSION])
-	var err := _check_http.request(CghConfig.check_update_url(),
+	_check_http.request(CghConfig.check_update_url(),
 		PackedStringArray(["Content-Type: application/json"]),
 		HTTPClient.METHOD_POST, body)
-	if err != OK:
-		push_warning("[CGHEVEN update] request() couldn't start (err %d)" % err)
-		update_failed.emit("Couldn't start update check (err %d)" % err)
 
 func _on_check(_r: int, code: int, _h: PackedStringArray, b: PackedByteArray) -> void:
-	var raw := b.get_string_from_utf8()
-	print("[CGHEVEN update] HTTP %d  response=%s" % [code, raw])
 	if code < 200 or code >= 300:
 		update_failed.emit("Update check failed (HTTP %d)" % code)
 		return
-	var d = JSON.parse_string(raw)
+	var d = JSON.parse_string(b.get_string_from_utf8())
 	if typeof(d) != TYPE_DICTIONARY:
 		update_failed.emit("Bad update response")
 		return
@@ -56,16 +49,10 @@ func _on_check(_r: int, code: int, _h: PackedStringArray, b: PackedByteArray) ->
 		if url == "":
 			# Update exists but no ZIP uploaded to the release yet — don't prompt a
 			# download that can't complete; surface only on a manual check.
-			push_warning("[CGHEVEN update] v%s available but the release has NO zip uploaded" % ver)
 			update_failed.emit("Update %s available, but no download is published yet." % ver)
 			return
 		update_available.emit(ver, notes, url)
 	else:
-		# e.g. {"update_available":false,"message":"No releases found for this addon."} —
-		# that message is the tell-tale that the Strapi release isn't matching (slug / is_active
-		# / not Published / non-numeric version).
-		print("[CGHEVEN update] no newer release. server_message=%s latest=%s" % [
-			str(d.get("message", "")), str(d.get("latest_version", "?"))])
 		up_to_date.emit()
 
 func download_and_stage(url: String) -> void:

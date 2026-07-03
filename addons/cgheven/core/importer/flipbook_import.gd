@@ -8,11 +8,11 @@ class_name CghFlipbookImport
 ## Handles .exr HDR sheets (load_exr_from_buffer) as well as png/jpg/webp.
 
 static func from_sheet(sheet_path: String, h_frames: int, v_frames: int, fps := 30.0) -> Sprite3D:
-	var img := Image.new()
-	var ext := sheet_path.get_extension().to_lower()
-	var ok: int = img.load_exr_from_buffer(FileAccess.get_file_as_bytes(sheet_path)) if ext == "exr" \
-		else img.load(sheet_path)
-	if ok != OK:
+	# SNIFF the real format from magic bytes rather than trusting the extension — CDN sheets
+	# are sometimes served as webp/jpg but named ".png", and Godot's extension-based img.load()
+	# then fails with a misleading "PNG corrupt" (png_driver_common). Sniffing decodes them.
+	var img := _decode_sheet(FileAccess.get_file_as_bytes(sheet_path), sheet_path.get_extension().to_lower())
+	if img == null:
 		push_error("[CGHEVEN] Could not load flipbook sheet: " + sheet_path)
 		return null
 	var tex := ImageTexture.create_from_image(img)
@@ -70,6 +70,29 @@ static func from_sheet(sheet_path: String, h_frames: int, v_frames: int, fps := 
 	ap.play("play")               # and starts immediately in the editor viewport
 	return spr
 
+
+## Decode a sprite-sheet from raw bytes, sniffing the real format from magic bytes (the file
+## extension often lies). PNG=89 50 4E 47, JPEG=FF D8, WEBP=RIFF....WEBP, EXR=76 2F 31 01.
+## Returns null on an unrecognised/corrupt body.
+static func _decode_sheet(body: PackedByteArray, ext: String) -> Image:
+	if body.size() < 12:
+		return null
+	var img := Image.new()
+	var ok := ERR_INVALID_DATA
+	if body[0] == 0x89 and body[1] == 0x50 and body[2] == 0x4E and body[3] == 0x47:
+		ok = img.load_png_from_buffer(body)
+	elif body[0] == 0xFF and body[1] == 0xD8:
+		ok = img.load_jpg_from_buffer(body)
+	elif body[0] == 0x52 and body[1] == 0x49 and body[2] == 0x46 and body[3] == 0x46 \
+			and body[8] == 0x57 and body[9] == 0x45 and body[10] == 0x42 and body[11] == 0x50:
+		ok = img.load_webp_from_buffer(body)
+	elif body[0] == 0x76 and body[1] == 0x2F and body[2] == 0x31 and body[3] == 0x01:
+		ok = img.load_exr_from_buffer(body)
+	elif ext == "exr":
+		ok = img.load_exr_from_buffer(body)   # magic missing but named .exr — try anyway
+	else:
+		return null
+	return img if ok == OK else null
 
 ## Returns a 3D-capable parent for the flipbook. If the edited scene root is a
 ## Node3D we use it directly; otherwise (Control / Node2D / plain Node scene) we

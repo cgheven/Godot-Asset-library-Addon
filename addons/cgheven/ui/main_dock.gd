@@ -29,6 +29,13 @@ var _thumb_http: Array[HTTPRequest] = []
 var _settings: CghSettingsModal
 var _login_dlg: CghLoginDialog
 
+# Top toast: a prominent colored bar for success/failure feedback (download + import),
+# so the user always sees WHAT happened and WHY — not just the small status line.
+var _toast: PanelContainer
+var _toast_icon: Label
+var _toast_msg: Label
+var _toast_timer: Timer
+
 var _subcat_dd: MenuButton
 var _subcat_items: Array = []   # popup id -> subcategory slug ("" = All)
 var _logo: TextureRect
@@ -39,9 +46,6 @@ var _category := ""
 var _subcat := ""
 var _subcats_by_parent := {}   # parent slug -> [{label, slug}] from the live category API
 var _search_text := ""
-var _pending_search := ""       # last text typed; applied after a short debounce (live search)
-var _search_debounce: Timer     # fires the search ~0.3s after the user stops typing
-var _last_total := 0            # total matching assets from the last server response (for the count line)
 var _sort_param := "createdAt:desc"
 var _loading := false
 var _thumb_ctx := {}     # HTTPRequest -> {card, url} | null when that slot is free
@@ -131,6 +135,7 @@ func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.add_theme_constant_override("separation", 4)
 	add_child(root)
+	root.add_child(_build_toast())           # prominent success/failure bar at the very top
 	root.add_child(_build_topnav())
 	root.add_child(_build_banner())
 	root.add_child(_build_searchrow())
@@ -214,6 +219,75 @@ func _build_topnav() -> HBoxContainer:
 	nav.add_child(refresh)
 	return nav
 
+# Prominent top toast (auto-hides). Green ✓ = success, red ✗ = failure, accent ℹ = info.
+# Lives at the top of the panel so download/import outcomes are impossible to miss.
+func _build_toast() -> PanelContainer:
+	_toast = PanelContainer.new()
+	_toast.visible = false
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	_toast.add_child(row)
+	_toast_icon = Label.new()
+	_toast_icon.add_theme_font_size_override("font_size", 14)
+	_toast_icon.add_theme_color_override("font_color", Color.WHITE)
+	_toast_icon.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	row.add_child(_toast_icon)
+	_toast_msg = Label.new()
+	_toast_msg.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_toast_msg.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_toast_msg.add_theme_font_size_override("font_size", 11)
+	_toast_msg.add_theme_color_override("font_color", Color.WHITE)
+	row.add_child(_toast_msg)
+	var x := Button.new()
+	x.flat = true
+	x.text = "✕"
+	x.add_theme_color_override("font_color", Color.WHITE)
+	x.add_theme_color_override("font_hover_color", Color.WHITE)
+	x.pressed.connect(_hide_toast)
+	x.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	row.add_child(x)
+	_toast_timer = Timer.new()
+	_toast_timer.one_shot = true
+	_toast_timer.timeout.connect(_hide_toast)
+	_toast.add_child(_toast_timer)
+	return _toast
+
+func _show_toast(msg: String, kind := "info") -> void:
+	if _toast == null or msg == "":
+		return
+	var col := CghConfig.C_ACCENT
+	var icon := "ℹ"
+	if kind == "success":
+		col = Color(0.16, 0.62, 0.34); icon = "✓"
+	elif kind == "error":
+		col = CghConfig.C_ERR; icon = "✗"
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = col
+	sb.set_corner_radius_all(4)
+	sb.set_content_margin_all(8.0)
+	_toast.add_theme_stylebox_override("panel", sb)
+	_toast_icon.text = icon
+	_toast_msg.text = msg
+	_toast.visible = true
+	if _toast_timer:
+		_toast_timer.stop()
+		_toast_timer.wait_time = 7.0 if kind == "error" else 3.5
+		_toast_timer.start()
+
+func _hide_toast() -> void:
+	if _toast:
+		_toast.visible = false
+	if _toast_timer:
+		_toast_timer.stop()
+
+# Set the small status line AND flash the top toast for a terminal outcome, and log a
+# warning when it failed — so every download/import result is visible + traceable.
+func _report(msg: String, ok: bool) -> void:
+	_set_status(msg, not ok)
+	_show_toast(msg, "success" if ok else "error")
+	if not ok:
+		push_warning("CGHEVEN: " + msg)
+
 # Admin-controlled announcement banner (server meta.banner) — like AE/Blender.
 func _build_banner() -> PanelContainer:
 	_banner = PanelContainer.new()
@@ -278,21 +352,10 @@ func _build_searchrow() -> HBoxContainer:
 	_search = LineEdit.new()
 	_search.placeholder_text = "Search assets…"
 	_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_search.clear_button_enabled = true    # built-in ✕ to clear the query instantly
-	# Live search: fire ~0.3s after the user stops typing — super fast, no Enter needed.
-	_search_debounce = Timer.new()
-	_search_debounce.one_shot = true
-	_search_debounce.wait_time = 0.3
-	_search_debounce.timeout.connect(_apply_search)
-	add_child(_search_debounce)
-	_search.text_changed.connect(func(t):
-		_pending_search = t
-		_search_debounce.start())          # restart the countdown on every keystroke
-	# Enter applies immediately (skips the debounce wait).
 	_search.text_submitted.connect(func(t):
-		_pending_search = t
-		_search_debounce.stop()
-		_apply_search())
+		_search_text = t
+		analytics.track("search_performed", {"query": t})
+		_load_first_page())
 	row.add_child(_search)
 	_sort = OptionButton.new()
 	for s in CghConfig.SORTS:
@@ -457,20 +520,8 @@ func _build_modals() -> void:
 	_login_dlg.logout_requested.connect(_do_logout)
 
 # ----------------------------------------------------------------- data
-# Apply the pending (typed) query — only refetches if it actually changed, so caret
-# moves / no-op keystrokes never spam the server.
-func _apply_search() -> void:
-	var q := _pending_search.strip_edges()
-	if q == _search_text:
-		return
-	_search_text = q
-	if q != "":
-		analytics.track("search_performed", {"query": q})
-	_load_first_page()
-
 func _load_first_page(force := false) -> void:
 	_page = 1
-	_page_count = 1        # reset so a stale multi-page bar never lingers over the new results
 	_thumb_fail = 0
 	_clear_grid()
 	_fetch(force)
@@ -571,7 +622,7 @@ func _fetch(force := false) -> void:
 			_render_assets(cached_assets, page.get("meta", {}))
 			return
 	_loading = true
-	_set_status(("Searching “%s”…" % _search_text.strip_edges()) if _search_text.strip_edges() != "" else "Loading…", false)
+	_set_status("Loading…", false)
 	# Pass category + subcategory separately: a subcategory filters the `subcategories`
 	# relation, a category filters `categorie` (different Strapi filters).
 	api.fetch_assets(_page, _page_size, _category, _search_text, _sort_param, _subcat)
@@ -592,29 +643,16 @@ func _render_assets(assets: Array, meta: Dictionary) -> void:
 		if _filter_mode == 2 and not CghDownloads.is_downloaded(a):
 			continue
 		_add_card(a)
-	var pg = meta.get("pagination", {})
-	_page_count = int(pg.get("pageCount", 1)) if pg is Dictionary else 1
-	_last_total = int(pg.get("total", _grid.get_child_count())) if pg is Dictionary else _grid.get_child_count()
-	var q := _search_text.strip_edges()
-	var shown := _grid.get_child_count()
-	if shown == 0:
-		var empty := "No results found."
-		if q != "":
-			empty = "No results for “%s”." % q
-		elif _filter_mode == 1: empty = "No free assets on this page."
+	if _grid.get_child_count() == 0:
+		var empty := "No assets found."
+		if _filter_mode == 1: empty = "No free assets on this page."
 		elif _filter_mode == 2: empty = "No downloaded assets on this page."
 		_set_status(empty, false)
 	else:
-		# Count line so the user always knows what happened (e.g. "12 results for “fire”").
-		var cnt := _last_total if _filter_mode == 0 else shown
-		var suffix := "" if cnt == 1 else "s"
-		if q != "":
-			_set_status("%d result%s for “%s”" % [cnt, suffix, q], false)
-		elif _page_count > 1:
-			_set_status("%d asset%s • page %d of %d" % [cnt, suffix, _page, _page_count], false)
-		else:
-			_set_status("%d asset%s" % [cnt, suffix], false)
+		_set_status("", false)
 	_render_banner(meta)
+	var pg = meta.get("pagination", {})
+	_page_count = int(pg.get("pageCount", 1)) if pg is Dictionary else 1
 	_render_page_bar()
 
 # Numbered pagination: 1 2 3 … last (windowed around the current page).
@@ -624,9 +662,7 @@ func _render_page_bar() -> void:
 	for c in _page_bar.get_children():
 		_page_bar.remove_child(c)
 		c.queue_free()
-	# Only show pages when there are actually cards below them — never float a "1 2 3 …"
-	# bar over an empty/short result (this is what made pages seem to sit "at the top").
-	if _filter_mode == 3 or _page_count <= 1 or _grid.get_child_count() == 0:
+	if _filter_mode == 3 or _page_count <= 1:
 		_page_bar.visible = false
 		return
 	_page_bar.visible = true
@@ -673,6 +709,7 @@ func _add_card(asset: Dictionary) -> CghAssetCard:
 	card.request_upgrade.connect(_on_card_upgrade)
 	card.favorite_toggled.connect(_on_favorite_toggled)
 	card.preview_requested.connect(_on_preview_requested)
+	card.flipbook_sheet_requested.connect(_on_flipbook_sheet_requested)
 	card.cancel_requested.connect(_on_card_cancel)
 	card.delete_requested.connect(_on_card_delete)
 	card.viewed.connect(func(a): analytics.track("asset_viewed", _asset_props(a)))
@@ -742,18 +779,6 @@ func _on_thumb(result: int, code: int, _h: PackedStringArray, body: PackedByteAr
 		var img: Image = null
 		if result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300:
 			img = _decode_image(body, ctx["url"])
-		if CghAsset.THUMB_DEBUG:
-			var mag := "none"
-			if body.size() >= 12:
-				if body[0] == 0x89: mag = "PNG"
-				elif body[0] == 0xFF and body[1] == 0xD8: mag = "JPG"
-				elif body[0] == 0x52 and body[8] == 0x57: mag = "WEBP"
-				else: mag = "NON-IMAGE"
-			var ttl := "?"
-			if is_instance_valid(ctx["card"]) and ctx["card"].asset != null:
-				ttl = CghAsset.title(ctx["card"].asset)
-			print("[CGHEVEN thumb] '%s' http=%d result=%d bytes=%d magic=%s decoded=%s url=%s" % [
-				ttl, code, result, body.size(), mag, str(img != null), str(ctx.get("url", ""))])
 		if img != null:
 			_thumb_fail = 0
 			if is_instance_valid(ctx["card"]):
@@ -766,8 +791,6 @@ func _on_thumb(result: int, code: int, _h: PackedStringArray, body: PackedByteAr
 			if _thumb_fail == 1:
 				_set_status("Thumbnail failed: result=%d http=%d (send me this)" % [result, code], true)
 			push_warning("CGHEVEN: thumbnail failed (result=%d http=%d) %s" % [result, code, str(ctx.get("url", ""))])
-			if is_instance_valid(ctx["card"]):
-				ctx["card"].set_thumbnail_placeholder()   # faint labeled tile instead of a pure-black void
 	_pump_thumbs()                         # start the next queued thumbnail
 
 # Decode a thumbnail from raw bytes. CGHEVEN thumbnails are usually .webp, but the URL
@@ -798,7 +821,11 @@ func _on_card_download(asset: Dictionary, entry: Dictionary) -> void:
 	if e.is_empty():
 		e = CghAsset.best_free_any(asset)   # nothing auto-importable, but still fetch the free file
 	if e.is_empty():
-		_set_status("No free file available for this asset.", true)
+		# Paid users unlock every file, so an empty entry here means the asset genuinely
+		# ships no free file for this plan — say so plainly instead of the click doing nothing.
+		var why := "No downloadable file for your plan on this asset." if not auth.is_logged_in() \
+			else "This asset has no file you can download right now."
+		_report(why, false)
 		return
 	# Already downloaded by any CGHEVEN addon -> import the local file, skip re-download.
 	var local := CghDownloads.local_path(e["filename"])
@@ -817,10 +844,21 @@ func _pump_queue() -> void:
 		return
 	_dl_active = _dl_queue.pop_front()
 	var e: Dictionary = _dl_active["entry"]
-	var headers := PackedStringArray()
-	if auth.is_logged_in():
+	# Match the AE/Blender addons: the file URL is a PUBLIC cdn.cgheven.com GET — send ONLY
+	# User-Agent + Referer, NEVER Authorization. A stray "Bearer" to the CDN/B2 origin makes it
+	# reject the request with 401 ("access denied") — exactly the failure seen on patreon assets
+	# even for a Pro user. The bearer belongs only on api.cgheven.com calls (the listing already
+	# sends it), so attach it only if the file URL is actually on our API host.
+	var url: String = str(e.get("url", ""))
+	var headers := PackedStringArray([
+		"User-Agent: CGHEVEN-Godot/%s" % CghConfig.ADDON_VERSION,
+		"Referer: https://cgheven.com/",
+	])
+	if auth.is_logged_in() and url.begins_with(CghConfig.api_base()):
 		headers.append("Authorization: Bearer " + auth.session_token)
 	_set_status("Downloading %s…" % e["filename"], false)
+	_show_toast("Downloading %s…" % e["filename"], "info")   # confirm the click actually started a download
+	push_warning("CGHEVEN: download start %s <- %s" % [e["filename"], str(e.get("url", ""))])
 	downloader.download(e["url"], e["filename"], headers)
 
 func _on_dl_progress(pct: float, _got: int, _total: int) -> void:
@@ -828,14 +866,19 @@ func _on_dl_progress(pct: float, _got: int, _total: int) -> void:
 		_dl_active["card"].set_progress(pct)
 
 func _on_dl_finished(path: String) -> void:
+	if _dl_active == null:
+		return   # defensive: a stray finished signal with no active job
 	var asset: Dictionary = _dl_active["asset"]
 	var entry: Dictionary = _dl_active.get("entry", {})
 	var fmt := str(entry.get("format", ""))
 	var res := str(entry.get("res", ""))
-	if _dl_active and is_instance_valid(_dl_active["card"]):
-		_dl_active["card"].set_download_done(true)
 	# Record into the shared cross-addon manifest so AE/Premiere/DaVinci show the ✓ too.
 	CghDownloads.record(asset, path, fmt, res)
+	if _dl_active and is_instance_valid(_dl_active["card"]):
+		_dl_active["card"].set_download_done(true)
+		# Re-evaluate the footer so it flips "Download" -> "Import" (and the ▾ rows update)
+		# live, right now — previously it only refreshed on a full grid rebuild / re-open.
+		_dl_active["card"].refresh_state()
 	_downloaded.append({"asset": asset, "path": path, "msg": ""})
 	_route_import(path, asset)             # fires asset_imported / import_failed itself
 	_dl_active = null
@@ -845,7 +888,7 @@ func _on_dl_failed(message: String) -> void:
 	var asset: Dictionary = _dl_active.get("asset", {}) if _dl_active else {}
 	if _dl_active and is_instance_valid(_dl_active["card"]):
 		_dl_active["card"].set_download_done(false)
-	_set_status(message, true)
+	_report(message, false)
 	analytics.track("download_failed", _asset_props(asset, {"reason": message}))
 	_dl_active = null
 	_pump_queue()
@@ -871,8 +914,30 @@ func _route_import(path: String, asset: Dictionary) -> void:
 				return
 			# no editor-importable model inside — fall through to the runtime router
 	var msg := CghImportRouter.import_file(path, cat)
-	_set_status(msg, false)
-	_track_import_result(asset, ext, not msg.to_lower().contains("failed"))
+	var ok := not msg.to_lower().contains("failed")
+	# EXR flipbook sheets fail in Godot (its tinyexr can't read DWAA/DWAB/PXR24/B44 compression).
+	# Auto-fall back to a PNG/JPG/WebP version of the SAME flipbook when the asset ships one, so
+	# the user gets a playing flipbook instead of a dead error toast.
+	if not ok and CghAsset.is_flipbook(asset) and ext == "exr":
+		var alt := _flipbook_image_alternative(asset)
+		if not alt.is_empty():
+			_show_toast("EXR flipbook can't load in Godot — fetching the PNG version instead…", "info")
+			push_warning("CGHEVEN: EXR flipbook import failed, auto-retrying with %s" % str(alt.get("filename", "")))
+			_on_card_download(asset, alt)   # queues the PNG download, then imports it
+			return
+		msg = "This flipbook only ships as an EXR compression Godot can't read yet — please try another flipbook (we're re-encoding these)."
+	_report(msg, ok)
+	_track_import_result(asset, ext, ok)
+
+# Lowest-res unlocked PNG/JPG/WebP entry for a flipbook — the fallback when its EXR sheet
+# won't load in Godot. Returns {} when the asset is EXR-only (no image variant to use).
+func _flipbook_image_alternative(asset: Dictionary) -> Dictionary:
+	var imgs := CghAsset.importable_entries(asset).filter(func(e):
+		return not e.get("locked", false) and str(e.get("ext", "")) in ["png", "jpg", "jpeg", "webp"])
+	if imgs.is_empty():
+		return {}
+	imgs.sort_custom(func(a, b): return int(a["res_rank"]) < int(b["res_rank"]))
+	return imgs[0]
 
 # asset_imported on success / import_failed on failure — matches the AE/Premiere
 # events (the import path used to always report success, even when it failed).
@@ -895,7 +960,7 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 	else:
 		res_path = CghImportRouter.copy_into_project(path, category)
 	if res_path == "":
-		_set_status("Couldn't copy the model into the project.", true)
+		_report("Couldn't copy the model into the project (check disk space / write permission).", false)
 		_track_import_result(asset, ext, false)
 		return
 	_set_status("Importing 3D model…", false)
@@ -930,16 +995,16 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 	if node == null:
 		if imported_res == null:
 			# File exists in the project but never loaded — a failed/corrupt import.
-			_set_status("Couldn't import %s — the model file looks corrupt or uses an unsupported glTF feature." % res_path.get_file(), true)
+			_report("Couldn't import %s — the model file looks corrupt or uses an unsupported glTF feature. Delete the download and try another resolution." % res_path.get_file(), false)
 			_track_import_result(asset, ext, false)
 		else:
 			# Imported, but not an auto-instanceable scene/mesh — leave it in the dock.
-			_set_status("Model saved to %s — drag it from FileSystem into your scene." % res_path, false)
+			_report("Model saved to %s — drag it from FileSystem into your scene." % res_path, true)
 			_track_import_result(asset, ext, true)
 		return
 	var root := EditorInterface.get_edited_scene_root()
 	if root == null:
-		_set_status("Model imported to %s — open a 3D scene, then drag it in." % res_path, false)
+		_report("Model imported to %s — open a 3D scene, then drag it in." % res_path, true)
 		_track_import_result(asset, ext, true)
 		return
 	root.add_child(node)
@@ -950,10 +1015,11 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 	if sel:
 		sel.clear()
 		sel.add_node(node)
-	_set_status("3D model added — press F in the viewport to frame it.", false)
+	_report("3D model added — press F in the viewport to frame it.", true)
 	_track_import_result(asset, ext, true)
 
-func _on_card_upgrade(_asset: Dictionary) -> void:
+func _on_card_upgrade(asset: Dictionary) -> void:
+	analytics.track("upgrade_clicked", _asset_props(asset))   # parity with AE/Premiere/Blender
 	OS.shell_open(CghConfig.pricing_url())
 
 # 🗑 Delete this asset's downloaded file(s) from disk, then flip the card back to
@@ -1021,6 +1087,37 @@ func _on_preview_requested(card, asset: Dictionary) -> void:
 				card.set_preview_frames(frames)
 			h.queue_free())
 		h.request(u)
+
+# Flipbook hover preview: download the REAL low-res sprite sheet (its filename declares the
+# grid AND the image genuinely IS that grid) and hand it to the card to slice + play. This
+# replaces slicing the card thumbnail, whose layout doesn't always match the sheet's NxM —
+# e.g. muzzle-flashes use a single-frame thumbnail, so slicing it 5x5 showed garbage frames.
+func _on_flipbook_sheet_requested(card, asset: Dictionary) -> void:
+	var grid := CghAsset.flipbook_grid(asset)
+	if grid.x * grid.y <= 1:
+		return
+	var e := _flipbook_image_alternative(asset)   # lowest-res unlocked png/jpg/webp sheet
+	if e.is_empty():
+		return
+	var url: String = str(e.get("url", ""))
+	if url == "":
+		return
+	var cached := CghCache.load_thumb(url)
+	if cached:
+		if is_instance_valid(card):
+			card.set_flipbook_sheet(cached, grid)
+		return
+	var h := HTTPRequest.new()
+	add_child(h)
+	h.request_completed.connect(func(r, code, _hh, body):
+		if r == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300:
+			var img := _decode_image(body, url)
+			if img != null:
+				CghCache.save_thumb(url, img)
+				if is_instance_valid(card):
+					card.set_flipbook_sheet(ImageTexture.create_from_image(img), grid)
+		h.queue_free())
+	h.request(url)
 
 # ----------------------------------------------------------------- favorites view
 func _render_favorites() -> void:
@@ -1102,29 +1199,15 @@ func _on_update_available(version: String, notes: String, url: String) -> void:
 	dlg.popup_centered()
 
 func _on_up_to_date() -> void:
-	# Show as a dialog (not the dock status bar, which is HIDDEN behind the open Settings
-	# modal) so a manual "Check for Updates" always gives visible feedback.
 	if _manual_check:
-		_notify_update("Check for Updates", "You're on the latest version (v%s)." % CghConfig.ADDON_VERSION)
+		_set_status("You're on the latest version.", false)
 	_manual_check = false
 
 func _on_update_failed(message: String) -> void:
-	# Silent on the automatic boot check; only surface if the user asked explicitly. Pass the
-	# real message through (e.g. "Update x.y available, but no download is published yet.")
-	# instead of a vague catch-all.
+	# Silent on the automatic boot check; only show if the user asked explicitly.
 	if _manual_check:
-		_notify_update("Check for Updates", message if message != "" else "Couldn't check for updates right now.")
+		_set_status("Couldn't check for updates right now.", false)
 	_manual_check = false
-
-## Small dialog that renders ON TOP of the Settings modal and frees itself when dismissed.
-func _notify_update(title: String, body: String) -> void:
-	var dlg := AcceptDialog.new()
-	dlg.title = title
-	dlg.dialog_text = body
-	add_child(dlg)
-	dlg.confirmed.connect(dlg.queue_free)
-	dlg.canceled.connect(dlg.queue_free)
-	dlg.popup_centered()
 
 func _on_update_staged() -> void:
 	analytics.track("update_completed")
@@ -1137,8 +1220,6 @@ func _on_update_staged() -> void:
 
 # ----------------------------------------------------------------- helpers
 func _clear_grid() -> void:
-	if _page_bar:
-		_page_bar.visible = false   # never leave a stale "1 2 3 …" bar floating over an empty grid
 	for c in _grid.get_children():
 		_grid.remove_child(c)
 		c.queue_free()

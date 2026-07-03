@@ -10,6 +10,25 @@ class_name CghConfig
 const ADDON_SLUG := "godot"
 const ADDON_VERSION := "1.0.0"
 
+# Distribution channel tag (build-time). Lets PostHog split installs by where the
+# user got the addon (website / godot_asset_library / adobe_exchange / …).
+# Resolution order:  env CGHEVEN_INSTALL_SOURCE  ->  bundled install_source.txt
+#   (res://addons/cgheven/install_source.txt, dropped in per-channel builds)  ->  default.
+const INSTALL_SOURCE_DEFAULT := "website"
+static func install_source() -> String:
+	var e := OS.get_environment("CGHEVEN_INSTALL_SOURCE").strip_edges()
+	if e != "":
+		return e
+	var p := "res://addons/cgheven/install_source.txt"
+	if FileAccess.file_exists(p):
+		var f := FileAccess.open(p, FileAccess.READ)
+		if f:
+			var t := f.get_as_text().strip_edges()
+			f.close()
+			if t != "":
+				return t
+	return INSTALL_SOURCE_DEFAULT
+
 static func api_base() -> String:
 	var e := OS.get_environment("CGHEVEN_API_BASE")
 	return e if e != "" else "https://api.cgheven.com"
