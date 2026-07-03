@@ -249,6 +249,8 @@ static func _archive_format(fname: String) -> String:
 		return "FBX"
 	if fu.find("_OBJ") != -1:
 		return "OBJ"
+	if fu.find("_USDC") != -1 or fu.find("_USDA") != -1 or fu.find("_USDZ") != -1 or fu.find("_USD") != -1:
+		return "USD"   # Godot 4.7 has no native USD import -> treat as non-importable
 	if fu.find("_BLEND") != -1:   # also matches _BLENDER
 		return "BLEND"
 	return ""
@@ -264,7 +266,10 @@ static func importable_entries(asset: Dictionary) -> Array:
 		var ext: String = e["ext"]
 		if ext in direct:
 			out.append(e)
-		elif ext == "zip" and e["format"] != "BLEND":
+		elif ext == "zip" and not (e["format"] in ["BLEND", "USD"]):
+			# .blend needs Blender; .usd/.usdc has no native Godot 4.7 importer — skip both so
+			# the addon never auto-picks a zip whose only model Godot can't read ("no importable
+			# file inside"). fbx/gltf/glb/obj zips still qualify.
 			out.append(e)
 	return out
 
@@ -289,8 +294,24 @@ static func best_free_entry(asset: Dictionary) -> Dictionary:
 		var imgs := cands.filter(func(e): return e["ext"] in ["png", "jpg", "jpeg", "webp"])
 		if not imgs.is_empty():
 			cands = imgs
-	cands.sort_custom(func(a, b): return a["res_rank"] < b["res_rank"])
+	# Lowest resolution first; at the SAME resolution prefer a Godot-native model format
+	# (gltf/glb > fbx > obj) so a 3D asset never auto-picks a format Godot imports poorly.
+	cands.sort_custom(func(a, b):
+		if int(a["res_rank"]) != int(b["res_rank"]):
+			return int(a["res_rank"]) < int(b["res_rank"])
+		return _fmt_priority(str(a["format"])) < _fmt_priority(str(b["format"])))
 	return cands[0]
+
+## Godot-import preference among 3D model formats (lower = better). Non-model formats tie at 3.
+static func _fmt_priority(fmt: String) -> int:
+	var f := fmt.to_upper()
+	if f == "GLTF" or f == "GLB":
+		return 0
+	if f == "FBX":
+		return 1
+	if f == "OBJ":
+		return 2
+	return 3
 
 ## Lowest-resolution UNLOCKED file of ANY format (even ones Godot can't auto-import,
 ## e.g. .rar). Fallback so a card whose only free file is non-importable still DOWNLOADS

@@ -52,12 +52,13 @@ func fetch_assets(page: int, page_size: int, category_slug: String, search: Stri
 		q += "&filters[$or][0][categorie][Slug][$eq]=" + es
 		q += "&filters[$or][1][subcategories][Slug][$eq]=" + es
 	else:
-		# "All" tab — restrict to the Godot-usable categories, but include BOTH the parent
-		# slugs (3d-models/hdri/flipbooks) AND their subcategory slugs (props, fire-
-		# flipbooks, …). An asset whose TOP categorie is a subcategory slug was being
-		# dropped from "All"; matching either level fixes "kuch assets nahi aate".
-		var usable := {}
+		# "All" tab — the Godot-usable categories only (3d-models / hdri / flipbooks + their
+		# subcategories). Match EITHER the top-level categorie OR the subcategories relation for
+		# EACH usable slug, exactly like the individual tabs do (those work reliably). The old
+		# `categorie.Slug $in [...]` form matched only the top level and behaved inconsistently on
+		# the authenticated proxy, so "All" showed only a handful of assets.
 		var slugs: Array = []
+		var usable := {}
 		for cat in CghConfig.CATEGORIES:
 			if cat["slug"] != "":
 				usable[cat["slug"]] = true
@@ -67,10 +68,11 @@ func fetch_assets(page: int, page_size: int, category_slug: String, search: Stri
 				continue
 			for s in CghConfig.SUBCATEGORIES[parent]:
 				slugs.append(s["slug"])
-		var i := 0
+		var oi := 0
 		for cs in slugs:
-			q += "&filters[categorie][Slug][$in][%d]=%s" % [i, str(cs).uri_encode()]
-			i += 1
+			var es := str(cs).uri_encode()
+			q += "&filters[$or][%d][categorie][Slug][$eq]=%s" % [oi, es]; oi += 1
+			q += "&filters[$or][%d][subcategories][Slug][$eq]=%s" % [oi, es]; oi += 1
 	if search.strip_edges() != "":
 		q += "&filters[Title][$containsi]=" + search.strip_edges().uri_encode()
 	# Drop any stale/in-flight request first, otherwise a previous (slow) request

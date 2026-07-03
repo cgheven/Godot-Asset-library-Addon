@@ -46,6 +46,9 @@ var _category := ""
 var _subcat := ""
 var _subcats_by_parent := {}   # parent slug -> [{label, slug}] from the live category API
 var _search_text := ""
+var _pending_search := ""       # last text typed; applied after a short debounce (live search)
+var _search_debounce: Timer     # fires the search ~0.3s after the user stops typing
+var _last_total := 0            # total matching assets from the last server response (for the count line)
 var _sort_param := "createdAt:desc"
 var _loading := false
 var _thumb_ctx := {}     # HTTPRequest -> {card, url} | null when that slot is free
@@ -352,10 +355,21 @@ func _build_searchrow() -> HBoxContainer:
 	_search = LineEdit.new()
 	_search.placeholder_text = "Search assets…"
 	_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_search.clear_button_enabled = true    # built-in ✕ to clear the query instantly
+	# Live search: fire ~0.3s after the user stops typing — super fast, no Enter needed.
+	_search_debounce = Timer.new()
+	_search_debounce.one_shot = true
+	_search_debounce.wait_time = 0.3
+	_search_debounce.timeout.connect(_apply_search)
+	add_child(_search_debounce)
+	_search.text_changed.connect(func(t):
+		_pending_search = t
+		_search_debounce.start())          # restart the countdown on every keystroke
+	# Enter applies immediately (skips the debounce wait).
 	_search.text_submitted.connect(func(t):
-		_search_text = t
-		analytics.track("search_performed", {"query": t})
-		_load_first_page())
+		_pending_search = t
+		_search_debounce.stop()
+		_apply_search())
 	row.add_child(_search)
 	_sort = OptionButton.new()
 	for s in CghConfig.SORTS:
@@ -520,8 +534,20 @@ func _build_modals() -> void:
 	_login_dlg.logout_requested.connect(_do_logout)
 
 # ----------------------------------------------------------------- data
+# Apply the pending (typed) query — only refetches if it actually changed, so caret
+# moves / no-op keystrokes never spam the server.
+func _apply_search() -> void:
+	var q := _pending_search.strip_edges()
+	if q == _search_text:
+		return
+	_search_text = q
+	if q != "":
+		analytics.track("search_performed", {"query": q})
+	_load_first_page()
+
 func _load_first_page(force := false) -> void:
 	_page = 1
+	_page_count = 1        # reset so a stale multi-page bar never lingers over the new results
 	_thumb_fail = 0
 	_clear_grid()
 	_fetch(force)
@@ -622,7 +648,7 @@ func _fetch(force := false) -> void:
 			_render_assets(cached_assets, page.get("meta", {}))
 			return
 	_loading = true
-	_set_status("Loading…", false)
+	_set_status(("Searching “%s”…" % _search_text.strip_edges()) if _search_text.strip_edges() != "" else "Loading…", false)
 	# Pass category + subcategory separately: a subcategory filters the `subcategories`
 	# relation, a category filters `categorie` (different Strapi filters).
 	api.fetch_assets(_page, _page_size, _category, _search_text, _sort_param, _subcat)
@@ -643,16 +669,29 @@ func _render_assets(assets: Array, meta: Dictionary) -> void:
 		if _filter_mode == 2 and not CghDownloads.is_downloaded(a):
 			continue
 		_add_card(a)
-	if _grid.get_child_count() == 0:
-		var empty := "No assets found."
-		if _filter_mode == 1: empty = "No free assets on this page."
+	var pg = meta.get("pagination", {})
+	_page_count = int(pg.get("pageCount", 1)) if pg is Dictionary else 1
+	_last_total = int(pg.get("total", _grid.get_child_count())) if pg is Dictionary else _grid.get_child_count()
+	var q := _search_text.strip_edges()
+	var shown := _grid.get_child_count()
+	if shown == 0:
+		var empty := "No results found."
+		if q != "":
+			empty = "No results for “%s”." % q
+		elif _filter_mode == 1: empty = "No free assets on this page."
 		elif _filter_mode == 2: empty = "No downloaded assets on this page."
 		_set_status(empty, false)
 	else:
-		_set_status("", false)
+		# Count line so the user always knows what happened (e.g. "12 results for “fire”").
+		var cnt := _last_total if _filter_mode == 0 else shown
+		var suffix := "" if cnt == 1 else "s"
+		if q != "":
+			_set_status("%d result%s for “%s”" % [cnt, suffix, q], false)
+		elif _page_count > 1:
+			_set_status("%d asset%s • page %d of %d" % [cnt, suffix, _page, _page_count], false)
+		else:
+			_set_status("%d asset%s" % [cnt, suffix], false)
 	_render_banner(meta)
-	var pg = meta.get("pagination", {})
-	_page_count = int(pg.get("pageCount", 1)) if pg is Dictionary else 1
 	_render_page_bar()
 
 # Numbered pagination: 1 2 3 … last (windowed around the current page).
@@ -662,7 +701,9 @@ func _render_page_bar() -> void:
 	for c in _page_bar.get_children():
 		_page_bar.remove_child(c)
 		c.queue_free()
-	if _filter_mode == 3 or _page_count <= 1:
+	# Only show pages when there are actually cards below them — never float a "1 2 3 …"
+	# bar over an empty/short result (this is what made pages seem to sit "at the top").
+	if _filter_mode == 3 or _page_count <= 1 or _grid.get_child_count() == 0:
 		_page_bar.visible = false
 		return
 	_page_bar.visible = true
@@ -926,6 +967,17 @@ func _route_import(path: String, asset: Dictionary) -> void:
 			_on_card_download(asset, alt)   # queues the PNG download, then imports it
 			return
 		msg = "This flipbook only ships as an EXR compression Godot can't read yet — please try another flipbook (we're re-encoding these)."
+	# HDRI EXRs at high resolution are often DWAA/DWAB compressed (Godot's tinyexr can't read
+	# those); the lowest resolution is usually uncompressed and loads fine. On failure, auto-fall
+	# back to the lowest-res EXR of the SAME HDRI so the user still gets a working sky.
+	if not ok and cat.contains("hdr") and ext in ["exr", "hdr"]:
+		var halt := _hdri_loadable_alternative(asset, path)
+		if not halt.is_empty():
+			_show_toast("This HDRI resolution can't load in Godot — fetching a lower resolution instead…", "info")
+			push_warning("CGHEVEN: HDRI import failed, auto-retrying with %s" % str(halt.get("filename", "")))
+			_on_card_download(asset, halt)   # queues the lower-res EXR, then imports it
+			return
+		msg = "This HDRI only ships in a compression Godot can't read yet — please try another HDRI (we're re-encoding these)."
 	_report(msg, ok)
 	_track_import_result(asset, ext, ok)
 
@@ -938,6 +990,20 @@ func _flipbook_image_alternative(asset: Dictionary) -> Dictionary:
 		return {}
 	imgs.sort_custom(func(a, b): return int(a["res_rank"]) < int(b["res_rank"]))
 	return imgs[0]
+
+# Lowest-res unlocked EXR/HDR entry for an HDRI — the fallback when a higher-res EXR won't load
+# (DWAA/DWAB). Returns {} when there's no lower alternative than the file that just failed.
+func _hdri_loadable_alternative(asset: Dictionary, failed_path: String) -> Dictionary:
+	var exrs := CghAsset.importable_entries(asset).filter(func(e):
+		return not e.get("locked", false) and str(e.get("ext", "")) in ["exr", "hdr"])
+	if exrs.is_empty():
+		return {}
+	exrs.sort_custom(func(a, b): return int(a["res_rank"]) < int(b["res_rank"]))
+	var lowest: Dictionary = exrs[0]
+	# Don't retry the exact file we just failed on (avoids a loop if even the lowest fails).
+	if str(lowest.get("filename", "")) == failed_path.get_file():
+		return {}
+	return lowest
 
 # asset_imported on success / import_failed on failure — matches the AE/Premiere
 # events (the import path used to always report success, even when it failed).
@@ -1166,20 +1232,23 @@ func _do_logout() -> void:
 	api.set_session_token("")
 	analytics.identify("", "Free")
 	_refresh_account_ui()
-	_load_first_page()
+	_load_first_page(true)   # force: the grid is cached per-plan, so a plan change must refetch
 
 func _on_logged_in(plan: String) -> void:
 	api.set_session_token(auth.session_token)
 	analytics.identify(auth.email, plan)
 	analytics.track("account_login")
 	_refresh_account_ui()
-	_load_first_page()
+	# FORCE a fresh fetch (bypass cache): the page cache is keyed per plan, and a stale
+	# page cached before login (or from an older query) must not be served to the logged-in
+	# user — that's what made "All" show only a couple of assets right after login.
+	_load_first_page(true)
 
 func _on_plan_refreshed(plan: String) -> void:
 	api.set_session_token(auth.session_token)
 	_refresh_account_ui()
 	_set_status("Plan updated: %s" % plan, false)
-	_load_first_page()
+	_load_first_page(true)   # force: access changed -> re-fetch instead of serving a stale page
 
 func _refresh_account_ui() -> void:
 	_login_btn.text = "👤 Account" if auth.is_logged_in() else "Login"
@@ -1220,6 +1289,8 @@ func _on_update_staged() -> void:
 
 # ----------------------------------------------------------------- helpers
 func _clear_grid() -> void:
+	if _page_bar:
+		_page_bar.visible = false   # never leave a stale "1 2 3 …" bar floating over an empty grid
 	for c in _grid.get_children():
 		_grid.remove_child(c)
 		c.queue_free()
