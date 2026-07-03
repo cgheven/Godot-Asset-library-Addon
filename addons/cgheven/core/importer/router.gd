@@ -30,15 +30,12 @@ static func import_file(path: String, category_slug: String) -> String:
 
 	var cat := category_slug.to_lower()
 	var msg := ""
-	# Category decides intent. Match the TOKEN, not exact equality, because the slug can be a
-	# SUBCATEGORY ("muzzle-flashes-flipbooks", "space-hdr", …) — matching "flipbooks" exactly
-	# used to send subcategory flipbook .exr sheets to the HDRI importer (wrong). Fall back to
-	# extension when the category is unknown.
-	if cat.contains("flipbook"):
+	# Category decides intent. Fall back to extension when the category is unknown.
+	if cat == "flipbooks":
 		msg = _do_flipbook(path)
-	elif cat.contains("hdr"):
+	elif cat == "hdri":
 		msg = _do_hdri(path)
-	elif cat == "3d-models" or cat.contains("model"):
+	elif cat == "3d-models":
 		msg = _do_3d(path)
 	elif ext in CghConfig.EXT_3D:
 		msg = _do_3d(path)

@@ -137,7 +137,7 @@ static func record(asset: Dictionary, fp: String, fmt: String, res: String) -> v
 	for r in arr:
 		if not (r is Dictionary):
 			continue
-		if _norm_id(r.get("id", "")) == id and str(r.get("fmt", "")) == fmt and str(r.get("res", "")) == res:
+		if str(r.get("id", "")) == id and str(r.get("fmt", "")) == fmt and str(r.get("res", "")) == res:
 			continue
 		kept.append(r)
 	kept.insert(0, {

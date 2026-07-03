@@ -20,8 +20,9 @@ var expires_at := ""   # ISO date the plan/session expires (shown in the Account
 var _server: TCPServer
 var _port := 0
 var _state := ""
-var _peers: Array = []            # [{peer, req, frames}] — ALL live loopback connections
-var _wait_frames := 0             # global poll ticks since login started (overall timeout)
+var _peer: StreamPeerTCP = null   # active loopback connection (read across ticks)
+var _req := ""                    # accumulated HTTP request bytes
+var _wait_frames := 0             # poll ticks spent waiting for the request line
 var _poll_timer: Timer = null     # polls the loopback server (Timers fire reliably in the editor; _process may not)
 var _exchange_http: HTTPRequest
 var _heartbeat_http: HTTPRequest
@@ -90,11 +91,12 @@ func start_login(register := false) -> void:
 func _start_poll() -> void:
 	if _poll_timer == null:
 		_poll_timer = Timer.new()
-		_poll_timer.wait_time = 0.05        # tick fast so we answer the browser's GET promptly
+		_poll_timer.wait_time = 0.1
 		_poll_timer.one_shot = false
 		add_child(_poll_timer)
 		_poll_timer.timeout.connect(_poll_login)
-	_peers = []
+	_peer = null
+	_req = ""
 	_wait_frames = 0
 	_poll_timer.start()
 
@@ -114,77 +116,49 @@ func _poll_login() -> void:
 	if _server == null or not _server.is_listening():
 		_stop_poll()
 		return
+	# 1) Accept one pending connection, then read it over the NEXT ticks. A single
+	#    tight in-tick loop races the OS: the browser's request bytes usually haven't
+	#    arrived yet, so we'd read nothing and report "no code". Spreading the read
+	#    across ticks lets the bytes actually arrive.
+	if _peer == null:
+		if not _server.is_connection_available():
+			return
+		_peer = _server.take_connection()
+		_req = ""
+		_wait_frames = 0
+		return
+	# 2) Pump the active connection until we have the request line (GET /...?code=...).
+	_peer.poll()
+	var st := _peer.get_status()
+	if st == StreamPeerTCP.STATUS_CONNECTING:
+		return
+	if st != StreamPeerTCP.STATUS_CONNECTED:
+		_finish_peer("")                 # closed before sending the request
+		return
+	var avail := _peer.get_available_bytes()
+	if avail > 0:
+		_req += _peer.get_utf8_string(avail)
 	_wait_frames += 1
-	# Accept EVERY pending connection this tick, not just one. Chrome/Edge open a speculative
-	# "preconnect" socket alongside the real request; the old code latched onto ONE socket, so
-	# if it grabbed the empty preconnect it blocked there while the real GET (carrying ?code=)
-	# sat unanswered in the backlog — the browser then just spun on the localhost URL until a
-	# 30s timeout. We now track them all and answer whichever one actually delivers the code.
-	while _server.is_connection_available():
-		var np := _server.take_connection()
-		if np != null:
-			_peers.append({"peer": np, "req": "", "frames": 0})
-	var i := _peers.size() - 1
-	while i >= 0:
-		var slot: Dictionary = _peers[i]
-		var peer: StreamPeerTCP = slot["peer"]
-		peer.poll()
-		var st := peer.get_status()
-		if st == StreamPeerTCP.STATUS_CONNECTING:
-			slot["frames"] = int(slot["frames"]) + 1
-			i -= 1
-			continue
-		if st != StreamPeerTCP.STATUS_CONNECTED:
-			_peers.remove_at(i)            # closed/errored (usually the idle preconnect) — drop it
-			i -= 1
-			continue
-		var avail := peer.get_available_bytes()
-		if avail > 0:
-			slot["req"] = str(slot["req"]) + peer.get_utf8_string(avail)
-		slot["frames"] = int(slot["frames"]) + 1
-		var req: String = str(slot["req"])
-		if req.find("\r\n") != -1:
-			var code := _extract_query_param(req, "code")
-			if code != "":
-				_answer_and_close(peer, code)   # 302 -> branded cgheven.com/addon-login/done page
-				_peers.remove_at(i)
-				_finish_login(code)
-				return
-			# Complete request line but no ?code= (favicon, bare hit) — send it to the error
-			# page and drop it; another peer may still carry the real code.
-			_answer_and_close(peer, "")
-			_peers.remove_at(i)
-			i -= 1
-			continue
-		# Idle socket that never sends a request line — retire it after ~4s. This NEVER fails
-		# the login; only the global timeout below can.
-		if int(slot["frames"]) > 80:
-			peer.disconnect_from_host()
-			_peers.remove_at(i)
-		i -= 1
-	if _wait_frames > 1200:                 # ~60s overall safety timeout at 0.05s/tick
-		_finish_login("")
+	if _req.find("\r\n") != -1:
+		_finish_peer(_extract_query_param(_req, "code"))
+	elif _wait_frames > 300:             # ~30s safety timeout at 0.1s/tick
+		_finish_peer("")
 
-# Write the browser's 302 redirect to the branded cgheven.com/addon-login/done page — exactly
-# like the Blender/AE/Premiere addons — so the user lands on our site, NOT a localhost page.
-# The loopback is only the secure handoff; it's never the landing.
-func _answer_and_close(peer: StreamPeerTCP, code: String) -> void:
-	var status := "ok" if code != "" else "error"
-	var dest := "%s/addon-login/done?addon=%s&status=%s" % [
-		CghConfig.web_base(), CghConfig.ADDON_SLUG, status]
-	var resp := "HTTP/1.1 302 Found\r\nLocation: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" % dest
-	peer.put_data(resp.to_utf8_buffer())
-	peer.poll()
-	peer.disconnect_from_host()
-
-# Tear down the loopback (close any stragglers + stop the server) and, if we caught a code,
-# redeem it for the session token.
-func _finish_login(code: String) -> void:
-	for slot in _peers:
-		var p: StreamPeerTCP = slot["peer"]
-		if p != null:
-			p.disconnect_from_host()
-	_peers = []
+# Write the browser's "you can close this tab" page, tear down the server, and
+# (if we got one) redeem the handoff code.
+func _finish_peer(code: String) -> void:
+	if _peer != null:
+		# Redirect the browser to the branded cgheven.com/addon-login/done page — exactly
+		# like the Blender/AE/Premiere addons — so the user lands on our site, NOT a
+		# localhost page. The loopback is just the secure handoff; it's never the landing.
+		var status := "ok" if code != "" else "error"
+		var dest := "%s/addon-login/done?addon=%s&status=%s" % [
+			CghConfig.web_base(), CghConfig.ADDON_SLUG, status]
+		var resp := "HTTP/1.1 302 Found\r\nLocation: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" % dest
+		_peer.put_data(resp.to_utf8_buffer())
+		_peer.poll()
+		_peer.disconnect_from_host()
+		_peer = null
 	if _server != null:
 		_server.stop()
 	_stop_poll()
@@ -202,13 +176,9 @@ func _extract_query_param(req: String, key: String) -> String:
 	var path := line.substr(qpos + 1)
 	path = path.split(" ")[0]   # strip trailing " HTTP/1.1"
 	for pair in path.split("&"):
-		# Split on the FIRST '=' only — the value is a JWT/base64 handoff code that itself
-		# contains '=' padding, so a plain split("=") would break into 3+ parts and drop it.
-		var eq := pair.find("=")
-		if eq == -1:
-			continue
-		if pair.substr(0, eq) == key:
-			return pair.substr(eq + 1).uri_decode()
+		var kv := pair.split("=")
+		if kv.size() == 2 and kv[0] == key:
+			return kv[1].uri_decode()
 	return ""
 
 func _exchange_code(code: String) -> void:

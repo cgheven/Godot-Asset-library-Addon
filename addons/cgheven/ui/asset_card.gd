@@ -11,7 +11,6 @@ signal request_download(asset: Dictionary, entry: Dictionary)   # entry={} -> be
 signal request_upgrade(asset: Dictionary)
 signal favorite_toggled(asset: Dictionary, is_fav: bool)
 signal preview_requested(card, asset)        # hover -> main_dock loads still frames
-signal flipbook_sheet_requested(card, asset) # hover on a flipbook -> main_dock fetches the real sprite sheet
 signal cancel_requested(card)                # ✕ on the in-flight download
 signal delete_requested(asset: Dictionary)   # 🗑 delete the downloaded file(s) -> re-download
 signal viewed(asset)                         # user opened the format/options dropdown
@@ -43,11 +42,12 @@ var _fav_btn: Button
 var _progress: ProgressBar
 var _footer: PanelContainer
 var _prog_row: HBoxContainer
-var _thumb_base: Texture2D
+var _thumb_base: Texture2D              # full thumbnail (the whole sprite-sheet for flipbooks)
+var _thumb_poster: Texture2D            # what the card shows at REST (bright poster cell for dark sheets)
+var _thumb_bg: ColorRect                # dark tile behind the thumbnail (lifted for placeholder)
 var _preview_frames: Array = []
 var _preview_idx := 0
 var _preview_loaded := false
-var _flipbook_sheet_asked := false   # asked main_dock for this flipbook's real sprite sheet already
 var _menu_entries: Array = []   # deduped entries backing the dropdown items
 var _delay_timer: Timer
 var _preview_timer: Timer
@@ -74,11 +74,6 @@ func setup(a: Dictionary) -> void:
 
 	var v := VBoxContainer.new()
 	v.add_theme_constant_override("separation", 4)
-	# PASS (not the default STOP) so a hover anywhere over this container — thumbnail,
-	# title, subtitle, footer gaps — propagates up to the card and fires mouse_entered.
-	# Without this the card only "saw" hovers on the bare label rows, so the preview
-	# played only when the pointer was on/below the title (the thumbnail ate the event).
-	v.mouse_filter = Control.MOUSE_FILTER_PASS
 	add_child(v)
 
 	# --- square thumbnail wrap (keeps a 1:1 aspect as the card width changes) ---
@@ -86,16 +81,15 @@ func setup(a: Dictionary) -> void:
 	_wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_wrap.custom_minimum_size = Vector2(0, MIN_W)
 	_wrap.clip_contents = true
-	_wrap.mouse_filter = Control.MOUSE_FILTER_PASS   # let hover over the thumbnail reach the card
 	_wrap.resized.connect(_keep_square)
 	v.add_child(_wrap)
 
 	# dark bg behind the (possibly still-loading) thumbnail
-	var thumb_bg := ColorRect.new()
-	thumb_bg.color = CghConfig.C_NAV
-	thumb_bg.set_anchors_preset(Control.PRESET_FULL_RECT)
-	thumb_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_wrap.add_child(thumb_bg)
+	_thumb_bg = ColorRect.new()
+	_thumb_bg.color = CghConfig.C_NAV
+	_thumb_bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_thumb_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_wrap.add_child(_thumb_bg)
 
 	_thumb = TextureRect.new()
 	_thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
@@ -134,7 +128,6 @@ func setup(a: Dictionary) -> void:
 	_title.clip_text = true
 	_title.add_theme_color_override("font_color", CghConfig.C_TEXT1)
 	_title.add_theme_font_size_override("font_size", 12)
-	_title.mouse_filter = Control.MOUSE_FILTER_PASS
 	v.add_child(_title)
 
 	# --- subtitle: "Category / Subcategory" ---
@@ -144,14 +137,12 @@ func setup(a: Dictionary) -> void:
 	_subtitle.clip_text = true
 	_subtitle.add_theme_color_override("font_color", CghConfig.C_TEXT3)
 	_subtitle.add_theme_font_size_override("font_size", 10)
-	_subtitle.mouse_filter = Control.MOUSE_FILTER_PASS
 	v.add_child(_subtitle)
 
 	# --- footer: .cdl-row pill [ main | sep | ▾ ] ---
 	_footer = PanelContainer.new()
 	_footer.add_theme_stylebox_override("panel", CghTheme.footer_pill_box())
 	_footer.custom_minimum_size = Vector2(0, 24)
-	_footer.mouse_filter = Control.MOUSE_FILTER_PASS   # gaps around the buttons still hover the card
 	v.add_child(_footer)
 	var frow := HBoxContainer.new()
 	frow.add_theme_constant_override("separation", 0)
@@ -458,9 +449,83 @@ func reset_after_cancel() -> void:
 	_apply_state()
 
 func set_thumbnail(tex: Texture2D) -> void:
-	if tex and _thumb:
-		_thumb.texture = tex
-		_thumb_base = tex
+	if not (tex and _thumb):
+		return
+	_thumb_base = tex                       # full sheet — kept so hover can still slice all frames
+	_thumb_poster = _static_poster(tex)     # what the card shows at rest (bright poster, not a dark grid)
+	_thumb.texture = _thumb_poster
+
+# Many flipbook thumbnails ARE the full sprite-sheet (e.g. a 5x5 grid) where the bright flash
+# occupies only 1-3 of the NxM cells — so ~97% of the image is black and the card reads as a
+# solid black tile (this is exactly why the Muzzle-Flashes category looked broken while Fire,
+# whose thumbnails happen to be bright single-frame posters, looked fine). For a dark tiled
+# sheet, pick the BRIGHTEST cell and show it as a static poster. _thumb_base stays the full
+# sheet so the hover animation still slices every frame. Non-flipbooks, unknown grids, and
+# already-bright single-frame posters are returned unchanged.
+func _static_poster(tex: Texture2D) -> Texture2D:
+	if asset == null or CghAsset.category_slug(asset) != "flipbooks":
+		return tex
+	var grid := CghAsset.flipbook_grid(asset)
+	var cols: int = maxi(1, grid.x)
+	var rows: int = maxi(1, grid.y)
+	if cols * rows <= 1:
+		return tex
+	var img := tex.get_image()
+	if img == null:
+		return tex
+	if img.is_compressed():
+		img.decompress()
+	var w := img.get_width()
+	var h := img.get_height()
+	if w < cols or h < rows:
+		return tex
+	# Cheap brightness probe on a 24x24 copy — leave already-bright single-frame posters alone,
+	# only rescue dark tiled sheets.
+	var probe: Image = img.duplicate()
+	probe.resize(24, 24, Image.INTERPOLATE_BILINEAR)
+	var mean := 0.0
+	for y in 24:
+		for x in 24:
+			var c := probe.get_pixel(x, y)
+			mean += maxf(c.r, maxf(c.g, c.b))
+	if mean / 576.0 > 0.16:                  # bright enough already -> use the thumbnail as-is
+		return tex
+	# Find the brightest cell of the sheet and show just that cell.
+	var cw := int(w / cols)
+	var ch := int(h / rows)
+	if cw < 1 or ch < 1:
+		return tex
+	var best := Rect2(0, 0, cw, ch)
+	var best_score := -1.0
+	for r in rows:
+		for c in cols:
+			var cell := img.get_region(Rect2i(c * cw, r * ch, cw, ch))
+			cell.resize(12, 12, Image.INTERPOLATE_BILINEAR)
+			var s := 0.0
+			for yy in 12:
+				for xx in 12:
+					var p := cell.get_pixel(xx, yy)
+					s += maxf(p.r, maxf(p.g, p.b))
+			if s > best_score:
+				best_score = s
+				best = Rect2(c * cw, r * ch, cw, ch)
+	if CghAsset.THUMB_DEBUG:
+		print("[CGHEVEN thumb] poster rescue '%s' grid=%dx%d mean=%.3f -> cell=%s" % [
+			CghAsset.title(asset), cols, rows, mean / 576.0, str(best)])
+	var at := AtlasTexture.new()
+	at.atlas = tex
+	at.region = best
+	return at
+
+## Card had NO decodable thumbnail (network/format failure) — show a faint placeholder tile
+## instead of a pure-black void. The title/subtitle labels below already name the asset.
+func set_thumbnail_placeholder() -> void:
+	_thumb_base = null
+	_thumb_poster = null
+	if _thumb:
+		_thumb.texture = null
+	if _thumb_bg:
+		_thumb_bg.color = CghConfig.C_CARD_HOVER
 
 func get_thumb_url() -> String:
 	return CghAsset.thumbnail(asset)
@@ -471,90 +536,65 @@ func _on_enter() -> void:
 	if _preview_loaded:
 		if _preview_frames.size() > 1:
 			_preview_timer.start()
-		return
-	if CghAsset.is_flipbook(asset):
-		# Flipbooks: play the REAL sprite sheet, not the card thumbnail. Ask main_dock to fetch
-		# the low-res sheet once; it calls set_flipbook_sheet() when ready. (Slicing the card
-		# thumbnail was unreliable — some categories, e.g. muzzle-flashes, use a single-frame
-		# thumbnail whose layout doesn't match the sheet's NxM, so slicing it showed garbage.)
-		if not _flipbook_sheet_asked:
-			_flipbook_sheet_asked = true
-			flipbook_sheet_requested.emit(self, asset)
-		return
-	# Non-flipbooks: brief debounce, then load still frames over the network.
-	_delay_timer.start()
+	elif not _try_build_flipbook_frames():
+		# Flipbooks play INSTANTLY (local sprite-sheet slice, above). Everything else waits
+		# a brief debounce before hitting the network for still frames.
+		_delay_timer.start()
 
 func _on_exit() -> void:
-	# Moving the pointer onto a child button (Download / ▾ / ♥) fires mouse_exited on the
-	# card even though the pointer is still INSIDE it. Ignore those spurious exits so the
-	# preview keeps playing across the whole card — only stop when truly leaving the card.
-	# (If the pointer then leaves the card VIA that child button, the card gets NO second
-	# mouse_exited — the watchdog in _next_preview_frame catches that case and stops.)
-	if is_visible_in_tree() and get_global_rect().has_point(get_global_mouse_position()):
-		return
-	_stop_preview()
-
-# Stop the hover preview and restore the card to its resting look.
-func _stop_preview() -> void:
 	add_theme_stylebox_override("panel", CghTheme.card_box(false))
 	_delay_timer.stop()
 	_preview_timer.stop()
-	# If the flipbook sheet never actually loaded (download failed / not a flipbook), allow a
-	# fresh attempt on the next hover instead of being stuck forever.
-	if not _preview_loaded:
-		_flipbook_sheet_asked = false
-	if _thumb_base:
-		_thumb.texture = _thumb_base   # revert to thumbnail
+	# Revert to the resting POSTER (bright cell), not the raw dark sheet — otherwise a flipbook
+	# card would turn black again after the first hover.
+	if _thumb_poster:
+		_thumb.texture = _thumb_poster
+	elif _thumb_base:
+		_thumb.texture = _thumb_base
 
 func _start_preview() -> void:
 	if _preview_loaded:
 		return
-	# Non-flipbooks: ask main_dock for still frames (flipbooks are handled in _on_enter via the
-	# real sprite-sheet download).
+	# Flipbooks: slice the sprite-sheet thumbnail into frames and PLAY it locally on hover
+	# (no network) — an actual flipbook animation. Other categories fall back to the
+	# still-image slideshow loaded by main_dock.
+	if _try_build_flipbook_frames():
+		return
 	preview_requested.emit(self, asset)
 
-# main_dock delivers the REAL low-res sprite sheet (as a texture) + its grid; slice it into
-# per-cell AtlasTexture frames and play. Using the actual sheet (not the card thumbnail)
-# guarantees the grid matches the image — this fixes categories like muzzle-flashes whose card
-# thumbnail is a single frame, not a contact sheet, so slicing it NxM produced garbage.
-func set_flipbook_sheet(tex: Texture2D, grid: Vector2i) -> void:
-	if tex == null:
-		return
+# Build AtlasTexture frames from the flipbook's sprite-sheet thumbnail and start playing.
+# Returns false (→ still-image fallback) when this isn't a flipbook, the grid is unknown,
+# or the thumbnail hasn't loaded yet.
+func _try_build_flipbook_frames() -> bool:
+	if CghAsset.category_slug(asset) != "flipbooks" or _thumb_base == null:
+		return false
+	var grid := CghAsset.flipbook_grid(asset)
+	if grid.x <= 1 and grid.y <= 1:
+		return false
 	var cols: int = maxi(1, grid.x)
 	var rows: int = maxi(1, grid.y)
-	if cols * rows <= 1:
-		return
-	var tw := tex.get_width()
-	var th := tex.get_height()
-	if tw < cols or th < rows:
-		return
-	# INTEGER cell size (float-divide then floor) so regions land on exact pixel boundaries —
-	# fractional regions sample slivers of the neighbouring cell and make the playback shimmer.
-	# The last column/row absorbs any remainder pixels so we never read past the sheet edge.
-	var cw := int(float(tw) / float(cols))
-	var ch := int(float(th) / float(rows))
-	if cw < 1 or ch < 1:
-		return
+	var tw := _thumb_base.get_width()
+	var th := _thumb_base.get_height()
+	if tw <= 0 or th <= 0 or cols * rows <= 1:
+		return false
+	var cw := float(tw) / float(cols)
+	var ch := float(th) / float(rows)
 	var frames := []
 	for r in rows:
 		for c in cols:
-			var w := cw if c < cols - 1 else tw - cw * (cols - 1)
-			var h := ch if r < rows - 1 else th - ch * (rows - 1)
 			var at := AtlasTexture.new()
-			at.atlas = tex
-			at.region = Rect2(c * cw, r * ch, w, h)
+			at.atlas = _thumb_base
+			at.region = Rect2(c * cw, r * ch, cw, ch)
 			frames.append(at)
 	if frames.size() <= 1:
-		return
+		return false
 	_preview_frames = frames
 	_preview_loaded = true
 	_preview_idx = 0
-	_preview_timer.wait_time = 0.04        # ~25 fps flipbook playback, smooth (stills use PREVIEW_FPS)
-	# Only start playing if the pointer is still over this card (the sheet may have finished
-	# downloading after the user moved on).
-	if is_visible_in_tree() and get_global_rect().has_point(get_global_mouse_position()):
-		_thumb.texture = frames[0]
-		_preview_timer.start()
+	_preview_timer.wait_time = 0.05        # ~20 fps flipbook playback (stills use PREVIEW_FPS)
+	_thumb.texture = frames[0]
+	_preview_timer.start()
+	return true
 
 func set_preview_frames(frames: Array) -> void:
 	_preview_frames = frames
@@ -567,12 +607,6 @@ func set_preview_frames(frames: Array) -> void:
 				_preview_timer.start()
 
 func _next_preview_frame() -> void:
-	# Watchdog: when the pointer leaves the card VIA a child button, the card never gets a
-	# second mouse_exited, so the preview would otherwise play forever. This frame timer only
-	# runs while previewing, so re-check the pointer each tick and stop once it's truly gone.
-	if not is_visible_in_tree() or not get_global_rect().has_point(get_global_mouse_position()):
-		_stop_preview()
-		return
 	if _preview_frames.is_empty():
 		return
 	_preview_idx = (_preview_idx + 1) % _preview_frames.size()

@@ -4,6 +4,10 @@ class_name CghAsset
 ## Helpers to read a Strapi asset dict and turn its files[] / green_screen[]
 ## into structured, Godot-relevant download entries.
 
+# Flip to true to trace thumbnail decode + poster-rescue in the Godot Output panel
+# (see main_dock._on_thumb and asset_card._static_poster).
+const THUMB_DEBUG := false
+
 static func attrs(asset: Dictionary) -> Dictionary:
 	return asset.get("attributes", asset)
 
@@ -67,19 +71,6 @@ static func category_slug(asset: Dictionary) -> String:
 	var da := _cat_attrs(asset)
 	return str(da.get("Slug", da.get("slug", "")))
 
-## True when this asset is a flipbook. CRITICAL: the category slug may be the PARENT
-## ("flipbooks") OR a SUBCATEGORY ("fire-flipbooks", "muzzle-flashes-flipbooks",
-## "tornado-fx-flipbooks", "magic-effects-flipbooks", …) — so match the "flipbook" TOKEN,
-## not exact equality. Before this, subcategory flipbooks silently missed the sprite-sheet
-## hover animation + PNG-preference + EXR fallback and fell back to the janky still-slideshow.
-static func is_flipbook(asset: Dictionary) -> bool:
-	return category_slug(asset).to_lower().contains("flipbook")
-
-## True when this asset is an HDRI (parent "hdri" or a subcategory like "space-hdr").
-static func is_hdri(asset: Dictionary) -> bool:
-	var s := category_slug(asset).to_lower()
-	return s == "hdri" or s.contains("hdr")
-
 ## Human-readable asset slug, like the Blender addon (assets_slug, fallbacks).
 static func assets_slug(asset: Dictionary) -> String:
 	var a := attrs(asset)
@@ -121,7 +112,8 @@ static func preview_images(asset: Dictionary) -> Array:
 ## previews / thumbnail (e.g. "..._8x8.png"). Vector2i(0,0) when unknown. Lets the card
 ## animate the flipbook on hover by slicing its sprite-sheet thumbnail into frames.
 static func flipbook_grid(asset: Dictionary) -> Vector2i:
-	# File-name grid — used to slice the REAL downloaded sheet in the importer.
+	var rx := RegEx.new()
+	rx.compile("(\\d+)\\s*[xX]\\s*(\\d+)")
 	var cands := []
 	for e in file_entries(asset):
 		cands.append(str(e.get("filename", "")))
@@ -129,40 +121,13 @@ static func flipbook_grid(asset: Dictionary) -> Vector2i:
 	cands.append(str(a.get("previews", "")))
 	cands.append(thumbnail(asset))
 	for c in cands:
-		var g := _grid_from(str(c))
-		if g.x >= 1 and g.y >= 1:
-			return g
+		var m := rx.search(str(c))
+		if m:
+			var cols := int(m.get_string(1))
+			var rows := int(m.get_string(2))
+			if cols >= 1 and rows >= 1 and cols <= 32 and rows <= 32:
+				return Vector2i(cols, rows)
 	return Vector2i(0, 0)
-
-## Grid used to slice the THUMBNAIL for the hover animation. The thumbnail's own layout
-## can differ from the downloadable sheet, so read the thumbnail/preview URL FIRST and
-## only fall back to file names. This fixes flipbooks whose hover preview looked wrong
-## because we were slicing the thumbnail by the (different) full-res sheet's grid.
-static func flipbook_thumb_grid(asset: Dictionary) -> Vector2i:
-	var a := attrs(asset)
-	var cands := [thumbnail(asset), str(a.get("previews", ""))]
-	for e in file_entries(asset):
-		cands.append(str(e.get("filename", "")))
-	for c in cands:
-		var g := _grid_from(str(c))
-		if g.x >= 1 and g.y >= 1:
-			return g
-	return Vector2i(0, 0)
-
-## Parse an NxM sprite-sheet grid from a filename/URL. Scans ALL "AxB" tokens and keeps
-## the last one where BOTH numbers are small (<=32) — a real grid like "_6x6". This skips
-## pixel dimensions such as "1920x1080" or "_4K_" that used to be grabbed as the grid
-## (returning the first match only), which produced 36 garbage frames from a resized sheet.
-static func _grid_from(text: String) -> Vector2i:
-	var rx := RegEx.new()
-	rx.compile("(\\d+)\\s*[xX]\\s*(\\d+)")
-	var best := Vector2i(0, 0)
-	for m in rx.search_all(text):
-		var cols := int(m.get_string(1))
-		var rows := int(m.get_string(2))
-		if cols >= 1 and rows >= 1 and cols <= 32 and rows <= 32:
-			best = Vector2i(cols, rows)   # keep the LAST small token (grid is the trailing _NxM)
-	return best
 
 static func is_new(asset: Dictionary) -> bool:
 	# treat early_access>0 or a releaseDate within ~21 days as "NEW"
@@ -285,7 +250,7 @@ static func best_free_entry(asset: Dictionary) -> Dictionary:
 	var cands := importable_entries(asset).filter(func(e): return not e["locked"])
 	if cands.is_empty():
 		return {}
-	if is_flipbook(asset):
+	if category_slug(asset) == "flipbooks":
 		var imgs := cands.filter(func(e): return e["ext"] in ["png", "jpg", "jpeg", "webp"])
 		if not imgs.is_empty():
 			cands = imgs
