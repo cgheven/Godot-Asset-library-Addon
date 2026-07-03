@@ -330,8 +330,16 @@ const _RES_DEFS := [
 	["(4096|3840)\\s*[x×]\\s*2160", "4K"],
 	["(2560\\s*[x×]\\s*1440|2048\\s*[x×]\\s*1080)", "2K"],
 	["1920\\s*[x×]\\s*1080", "1080p"],
+	# ALL K resolutions must be recognised. A missing one (e.g. 6K) resolves to "" -> rank 0,
+	# which best_free_entry then treats as the LOWEST/"best" file — so a logged-in (unlocked)
+	# user would auto-pick the 6K DWAA HDRI Godot can't read. Cover 1K..16K explicitly.
+	["(?<![a-z0-9])16\\s*k(?![a-z0-9])|16384", "16K"],
+	["(?<![a-z0-9])12\\s*k(?![a-z0-9])|12288", "12K"],
 	["(?<![a-z0-9])8\\s*k(?![a-z0-9])|8192", "8K"],
+	["(?<![a-z0-9])6\\s*k(?![a-z0-9])|6144", "6K"],
+	["(?<![a-z0-9])5\\s*k(?![a-z0-9])|5120", "5K"],
 	["(?<![a-z0-9])4\\s*k(?![a-z0-9])|4096|uhd", "4K"],
+	["(?<![a-z0-9])3\\s*k(?![a-z0-9])|3072", "3K"],
 	["(?<![a-z0-9])2\\s*k(?![a-z0-9])|2048", "2K"],
 	["(?<![a-z0-9])1\\s*k(?![a-z0-9])|1024", "1K"],
 	["2160", "4K"],
@@ -342,7 +350,7 @@ const _RES_DEFS := [
 # Low-first rank used to pick the "best free entry" (1K before 4K), like the addons.
 const _RES_RANK := {
 	"": 0, "PREVIEW": 1, "480P": 2, "720P": 3, "HD": 3,
-	"1080P": 4, "1K": 5, "2K": 6, "4K": 7, "5K": 8, "8K": 9, "16K": 10,
+	"1080P": 4, "1K": 5, "2K": 6, "3K": 7, "4K": 8, "5K": 9, "6K": 10, "8K": 11, "12K": 12, "16K": 13,
 }
 static var _res_rx := []   # [{rx, label}] compiled lazily
 
