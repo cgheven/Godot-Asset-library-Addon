@@ -1,0 +1,27 @@
+# Godot 4+ editor cache
+.godot/
+
+# CGHEVEN runtime download cache (never commit). Root-anchored (/CGHEVEN/) so it does
+# NOT also match the addon folder "addons/cgheven" on case-insensitive filesystems
+# (Windows/macOS) — an un-anchored "CGHEVEN/" would ignore the whole plugin.
+/CGHEVEN/
+addons/cgheven/CGHEVEN/
+
+# Build artifacts / distribution zips
+*.zip
+Install CGHEVEN*.bat
+*.command
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Godot exports
+export_presets.cfg
+*.import
+
+# AssetLib repo = plugin only. Keep the local test-project scaffolding OUT of the
+# published repo so installing "CGHEVEN Asset Library" never dumps a project.godot
+# or demo files into the user's own project (kept locally, just not committed).
+project.godot
+INSTALL.md
