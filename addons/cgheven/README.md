@@ -59,4 +59,4 @@ See [LICENSE](LICENSE). © CGHEVEN.
 
 ## Links
 - Website: https://cgheven.com
-- Discord: https://discord.gg/cgheven
+- Discord: https://discord.gg/J3xXRrM5k

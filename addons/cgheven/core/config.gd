@@ -69,9 +69,11 @@ static func analytics_track_url() -> String:
 static func check_update_url() -> String:
 	return api_base() + "/api/addon-updates/check"
 static func pricing_url() -> String:
-	return web_base() + "/pricing"
+	# ?src=godot tells the website which addon sent the user (no referrer
+	# comes with a browser opened from the editor).
+	return web_base() + "/pricing?src=" + ADDON_SLUG
 static func discord_url() -> String:
-	return "https://discord.gg/cgheven"
+	return "https://discord.gg/J3xXRrM5k"
 
 # PostHog (analytics) — same project as the desktop addons.
 static func posthog_host() -> String:
@@ -208,7 +210,7 @@ const EXT_ARCHIVE := ["zip"]
 const RES_ORDER := ["1k", "2k", "4k", "8k", "16k"]
 
 # Discord invite (Godot community — placeholder, set real link before ship)
-const DISCORD := "https://discord.gg/cgheven"
+const DISCORD := "https://discord.gg/J3xXRrM5k"
 
 static func ensure_dirs() -> void:
 	for d in [DATA_DIR, CACHE_DIR, THUMB_DIR, DOWNLOAD_DIR]:
