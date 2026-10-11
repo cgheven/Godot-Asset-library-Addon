@@ -517,6 +517,7 @@ func _on_subcat_selected(id: int) -> void:
 func _build_modals() -> void:
 	_settings = CghSettingsModal.new()
 	_settings.auth = auth
+	_settings.analytics = analytics
 	add_child(_settings)
 	_settings.build()
 	_settings.logout_requested.connect(_do_logout)
@@ -527,6 +528,7 @@ func _build_modals() -> void:
 
 	_login_dlg = CghLoginDialog.new()
 	_login_dlg.auth = auth
+	_login_dlg.analytics = analytics
 	add_child(_login_dlg)
 	_login_dlg.build()
 	# Account details (email/plan) now live in this dialog's profile view, with the
@@ -1085,7 +1087,9 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 	_track_import_result(asset, ext, true)
 
 func _on_card_upgrade(asset: Dictionary) -> void:
-	analytics.track("upgrade_clicked", _asset_props(asset))   # parity with AE/Premiere/Blender
+	# The card shows "Upgrade" only for a locked asset, so this is also the locked-asset click.
+	analytics.track("locked_asset_clicked", _asset_props(asset, {"reason": "locked"}))
+	analytics.track("upgrade_clicked", _asset_props(asset, {"source": "card", "src": CghConfig.ADDON_SLUG}))   # parity with AE/Premiere/Blender
 	OS.shell_open(CghConfig.pricing_url())
 
 # 🗑 Delete this asset's downloaded file(s) from disk, then flip the card back to

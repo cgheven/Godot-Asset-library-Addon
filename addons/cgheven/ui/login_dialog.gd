@@ -10,6 +10,7 @@ class_name CghLoginDialog
 signal logout_requested()
 
 var auth: CghAuth
+var analytics: CghAnalytics   # set by the dock; may be null
 var _content: VBoxContainer
 var _msg: Label
 
@@ -28,6 +29,12 @@ func build() -> void:
 	_render()
 
 ## Open the dialog showing the right view for the current auth state.
+## Opens the pricing page; first reports which button did it (analytics only, never blocks).
+func _open_pricing(source: String) -> void:
+	if analytics:
+		analytics.track("upgrade_clicked", {"source": source, "src": CghConfig.ADDON_SLUG})
+	OS.shell_open(CghConfig.pricing_url())
+
 func open() -> void:
 	_render()
 	reset_size()
@@ -66,7 +73,7 @@ func _build_profile() -> void:
 
 	# Premium users (Pro/Studio/Bundle) have nothing to upgrade to — hide the button.
 	if not auth.is_premium():
-		var up := _brand_btn("⚡ Upgrade Plan", func(): OS.shell_open(CghConfig.pricing_url()))
+		var up := _brand_btn("⚡ Upgrade Plan", func(): _open_pricing("login"))
 		_content.add_child(up)
 
 	var lo := Button.new()

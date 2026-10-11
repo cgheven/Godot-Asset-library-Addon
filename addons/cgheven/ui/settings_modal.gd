@@ -11,6 +11,7 @@ signal check_updates_requested()
 signal download_dir_changed()
 
 var auth: CghAuth
+var analytics: CghAnalytics   # set by the dock; may be null
 var _path_lbl: Label
 var _dir_dialog: FileDialog
 var _upgrade_btn: Button   # hidden for premium users (nothing to upgrade to)
@@ -43,7 +44,7 @@ func build() -> void:
 	_section(v, "App")
 	_kv(v, "Version", CghConfig.ADDON_VERSION)
 	_action_btn(v, "Check for Updates", func(): check_updates_requested.emit())
-	_upgrade_btn = _brand_btn(v, "⚡ Upgrade Plan", func(): OS.shell_open(CghConfig.pricing_url()))
+	_upgrade_btn = _brand_btn(v, "⚡ Upgrade Plan", func(): _open_pricing("settings"))
 	_gap(v)
 
 	# ---------- Downloads (user can choose the folder) ----------
@@ -107,6 +108,12 @@ func refresh() -> void:
 ## content min-size only after it is shown, so the naive reset_size()+popup_centered()
 ## opened huge the first time. Show → wait one frame (layout runs) → wrap to content →
 ## re-center. Subsequent opens are already correct.
+## Opens the pricing page; first reports which button did it (analytics only, never blocks).
+func _open_pricing(source: String) -> void:
+	if analytics:
+		analytics.track("upgrade_clicked", {"source": source, "src": CghConfig.ADDON_SLUG})
+	OS.shell_open(CghConfig.pricing_url())
+
 func open_centered() -> void:
 	refresh()
 	popup_centered()
