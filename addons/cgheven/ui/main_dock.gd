@@ -358,7 +358,7 @@ func _render_banner(meta: Dictionary) -> void:
 		ab.text = str(btn.get("label", "Learn more"))
 		ab.add_theme_color_override("font_color", Color.WHITE)
 		var url := str(btn.get("url", ""))
-		ab.pressed.connect(func(): OS.shell_open(url))
+		ab.pressed.connect(func(): CghConfig.open_url_safe(url))
 		row.add_child(ab)
 	var x := Button.new()
 	x.flat = true
@@ -512,11 +512,15 @@ func _on_categories_loaded(cats: Array) -> void:
 		var label := str(a.get("Name", a.get("name", a.get("Title", slug)))).strip_edges()
 		var parent := _parent_slug_of(a)
 		if parent == "":
+			if not CghConfig.GODOT_TABS.has(slug.to_lower()):
+				continue                    # Godot can't use this category (video / VDB / Blender-only): never show it
 			if slug == "" or seen.has(slug.to_lower()):
 				continue                    # a top-level tab needs a slug to filter on
 			seen[slug.to_lower()] = true
 			tops.append({"label": _tidy_label(label if label != "" else slug), "slug": slug, "ord": tops.size()})
 		else:
+			if not CghConfig.GODOT_TABS.has(parent.to_lower()):
+				continue                    # a child of a category Godot can't use
 			if slug == "" and label == "":
 				continue
 			# A child whose Slug is blank in the CMS can't be matched by slug: use its Name instead.
@@ -711,7 +715,16 @@ func _goto_page(p: int) -> void:
 # (e.g. "explosions-vfx"), so matching only the parent slug would miss them. [] = the All tab.
 func _tab_slugs() -> Array:
 	if _category == "":
-		return []
+		# All = every tab Godot supports + their subcategories (never the video / VDB / Blender-only ones).
+		var all_slugs: Array = []
+		for t in _top_cats:
+			var ts := str(t["slug"])
+			if ts == "":
+				continue
+			all_slugs.append(ts)
+			for sc in _subcats_by_parent.get(ts, CghConfig.SUBCATEGORIES.get(ts, [])):
+				all_slugs.append(str(sc["slug"]))
+		return all_slugs
 	var out: Array = [_category]
 	for sc in _subcats_by_parent.get(_category, CghConfig.SUBCATEGORIES.get(_category, [])):
 		out.append(str(sc["slug"]))
@@ -748,6 +761,8 @@ func _render_assets(assets: Array, meta: Dictionary) -> void:
 	if _filter_mode == 3:
 		return
 	for a in assets:
+		if CghAsset.importable_entries(a).is_empty():
+			continue   # nothing Godot can import in this asset (rar / video / blend only): don't offer it
 		if _filter_mode == 1 and not CghAsset.has_free_file(a):
 			continue
 		if _filter_mode == 2 and not CghDownloads.is_downloaded(a):
@@ -979,11 +994,18 @@ func _pump_queue() -> void:
 	# even for a Pro user. The bearer belongs only on api.cgheven.com calls (the listing already
 	# sends it), so attach it only if the file URL is actually on our API host.
 	var url: String = str(e.get("url", ""))
+	if not CghConfig.is_trusted_url(url):
+		# a file link that is not https on a CGHEVEN host (CMS typo or tampered data): never fetch it
+		downloader.last_stage = "blocked_url"
+		downloader.last_status = 0
+		downloader.last_result = 0
+		_on_dl_failed("Blocked a download link that is not on a CGHEVEN server (this asset's link looks broken).")
+		return
 	var headers := PackedStringArray([
 		"User-Agent: CGHEVEN-Godot/%s" % CghConfig.ADDON_VERSION,
 		"Referer: https://cgheven.com/",
 	])
-	if auth.is_logged_in() and url.begins_with(CghConfig.api_base()):
+	if auth.is_logged_in() and url.begins_with(CghConfig.api_base() + "/"):
 		headers.append("Authorization: Bearer " + auth.session_token)
 	_set_status("Downloading %s…" % e["filename"], false)
 	_show_toast("Downloading %s…" % e["filename"], "info")   # confirm the click actually started a download

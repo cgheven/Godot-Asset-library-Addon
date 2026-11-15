@@ -12,6 +12,7 @@ signal update_failed(message: String)
 
 var _check_http: HTTPRequest
 var _dl: CghDownloader
+var _expected_sha256 := ""   # optional: the backend may send the zip's SHA-256; verified when present
 var _chk_t0 := 0   # ticks: update-check request start (api_call_performance)
 
 func _ready() -> void:
@@ -65,6 +66,11 @@ func _on_check(r: int, code: int, _h: PackedStringArray, b: PackedByteArray) -> 
 			CghAnalytics.update_failed("no_download", "Update %s available but no download is published" % ver, CghConfig.ADDON_VERSION, ver)
 			update_failed.emit("Update %s available, but no download is published yet." % ver)
 			return
+		if not CghConfig.is_trusted_url(url):
+			CghAnalytics.update_failed("untrusted_url", "Update download link is not on a CGHEVEN server", CghConfig.ADDON_VERSION, ver)
+			update_failed.emit("Update link was rejected (not a CGHEVEN server).")
+			return
+		_expected_sha256 = str(d.get("sha256", "")).strip_edges().to_lower()
 		update_available.emit(ver, notes, url)
 	else:
 		up_to_date.emit()
@@ -73,6 +79,10 @@ func download_and_stage(url: String) -> void:
 	_dl.download(url, "cgheven_update.zip")
 
 func _on_zip_downloaded(zip_path: String) -> void:
+	if _expected_sha256 != "" and FileAccess.get_sha256(zip_path).to_lower() != _expected_sha256:
+		CghAnalytics.update_failed("sha256_mismatch", "Update zip failed its integrity check", CghConfig.ADDON_VERSION)
+		update_failed.emit("The update download failed its integrity check and was NOT installed. Please try again.")
+		return
 	var reader := ZIPReader.new()
 	if reader.open(zip_path) != OK:
 		CghAnalytics.update_failed("open_zip", "Could not open update zip", CghConfig.ADDON_VERSION)
@@ -87,6 +97,12 @@ func _on_zip_downloaded(zip_path: String) -> void:
 		var idx := rel.find("addons/cgheven/")
 		if idx != -1:
 			rel = rel.substr(idx + "addons/cgheven/".length())
+		# Zip-slip guard: an entry may never climb out of res://addons/cgheven/ ('../project.godot' would
+		# overwrite the user's project settings / autoloads and run code in the editor).
+		rel = rel.replace("\\", "/")
+		if rel == "" or rel.begins_with("/") or rel.contains(":") or ("/" + rel + "/").contains("/../"):
+			push_warning("CGHEVEN: skipped unsafe update entry")
+			continue
 		var out_path := base + rel
 		DirAccess.make_dir_recursive_absolute(out_path.get_base_dir())
 		var f := FileAccess.open(out_path, FileAccess.WRITE)

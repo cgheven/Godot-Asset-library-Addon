@@ -168,6 +168,11 @@ static func extract_model_from_zip(zip_path: String) -> String:
 		if entry.ends_with("/"):
 			continue
 		var rel := entry.replace("\\", "/")
+		# Zip-slip guard: never let an entry name climb out of the extraction folder
+		# ("../../x", "/abs/x", "C:/x"). Such entries are skipped, not extracted.
+		if rel.begins_with("/") or rel.contains(":") or ("/" + rel + "/").contains("/../"):
+			push_warning("CGHEVEN: skipped unsafe zip entry")
+			continue
 		var out := out_dir.path_join(rel)
 		DirAccess.make_dir_recursive_absolute(out.get_base_dir())
 		var f := FileAccess.open(out, FileAccess.WRITE)

@@ -62,19 +62,32 @@ func fetch_assets(page: int, page_size: int, category_slug: String, search: Stri
 	if subcat != "":
 		sels = [subcat]
 	elif not slugs.is_empty():
-		sels = slugs.slice(0, 16)      # the server answers HTTP 500 to very long $or lists
+		sels = slugs.slice(0, 20)      # keep the $in list short (the query-string parser caps arrays at 20)
 	elif category_slug != "":
 		sels = [category_slug]
 	var oi := 0
+	var slug_list: Array = []
+	var name_list: Array = []
 	for sel in sels:
-		var field := "Slug"
 		var val := str(sel)
 		if val.begins_with("name:"):    # a category whose Slug is blank in the CMS: match it by Name instead
-			field = "Name"
-			val = val.substr(5)
-		var ev := val.uri_encode()
-		q += "&filters[$or][%d][categorie][%s][$eq]=%s" % [oi, field, ev]; oi += 1
-		q += "&filters[$or][%d][subcategories][%s][$eq]=%s" % [oi, field, ev]; oi += 1
+			name_list.append(val.substr(5))
+		else:
+			slug_list.append(val)
+	# ONE $in list per relation instead of one $or clause per slug (a long $or list makes the server answer HTTP 500).
+	if not slug_list.is_empty():
+		for rel in ["categorie", "subcategories"]:
+			for i in slug_list.size():
+				q += "&filters[$or][%d][%s][Slug][$in][%d]=%s" % [oi, rel, i, str(slug_list[i]).uri_encode()]
+			oi += 1
+	for nm in name_list:
+		q += "&filters[$or][%d][categorie][Name][$eq]=%s" % [oi, str(nm).uri_encode()]; oi += 1
+		q += "&filters[$or][%d][subcategories][Name][$eq]=%s" % [oi, str(nm).uri_encode()]; oi += 1
+	# Some flipbooks are filed under VFX in the CMS (all of them have "Flipbook" in the title). Without this
+	# the Flipbooks tab and All would miss them, and the VFX category itself is video that Godot can't play.
+	if subcat == "" and slug_list.has("flipbooks"):
+		q += "&filters[$or][%d][Title][$containsi]=flipbook" % oi
+		oi += 1
 	if search.strip_edges() != "":
 		q += "&filters[Title][$containsi]=" + search.strip_edges().uri_encode()
 	# Drop any stale/in-flight request first, otherwise a previous (slow) request

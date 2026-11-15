@@ -384,7 +384,7 @@ func _on_menu_pick(idx: int) -> void:
 		ID_COPY:
 			DisplayServer.clipboard_set(_asset_url())
 		ID_VIEW:
-			OS.shell_open(_asset_url())
+			CghConfig.open_url_safe(_asset_url())
 		ID_DEL:
 			delete_requested.emit(asset)
 		_:

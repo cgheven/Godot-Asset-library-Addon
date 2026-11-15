@@ -66,6 +66,23 @@ static func heartbeat_url() -> String:
 # key stays server-side — the addon never ships a key.
 static func analytics_track_url() -> String:
 	return api_base() + "/api/analytics/track"
+# Only https links to our own hosts (or our B2 bucket) are ever opened, downloaded from, or sent a token.
+# Anything else (file://, custom protocol handlers, look-alike hosts, user@host tricks) is refused.
+static func is_trusted_url(url: String) -> bool:
+	if not url.begins_with("https://"):
+		return false
+	var host := url.substr(8).split("/")[0].split("?")[0].split("#")[0].to_lower()
+	if host.contains("@") or host.contains("\\"):
+		return false
+	host = host.split(":")[0]
+	return host == "cgheven.com" or host.ends_with(".cgheven.com") or host.ends_with(".backblazeb2.com")
+
+static func open_url_safe(url: String) -> void:
+	if is_trusted_url(url):
+		OS.shell_open(url)
+	else:
+		push_warning("CGHEVEN: refused to open a link that is not on a CGHEVEN server")
+
 static func check_update_url() -> String:
 	return api_base() + "/api/addon-updates/check"
 static func pricing_url() -> String:
@@ -180,15 +197,18 @@ const GRID_GAP  := 7
 # Fallback tabs, used only until (or if) the live category list can't be loaded. The real tabs come
 # from the backend (/api/proxy/categories) - see CghMainDock._on_categories_loaded - so every
 # top-level category the library has shows up and new ones appear automatically.
+# ONLY categories whose files Godot can really import and use. Everything else is hidden on purpose:
+#   vfx   = mp4/mov video (Godot only plays Ogg Theora, no H.264, no alpha video)
+#   vdbs  = OpenVDB volumes (Godot cannot import .vdb)
+#   shaders = Blender .blend files (Godot shaders are .gdshader)
+# Flipbooks, HDRI and 3D models are image sheets / EXR / glTF-FBX that Godot imports natively.
+const GODOT_TABS := ["3d-models", "hdri", "flipbooks"]
+
 const CATEGORIES := [
 	{"label": "All",       "slug": ""},
 	{"label": "3D Models", "slug": "3d-models"},
 	{"label": "HDRI",      "slug": "hdri"},
 	{"label": "Flipbooks", "slug": "flipbooks"},
-	{"label": "VFX",       "slug": "vfx"},
-	{"label": "VDBs",      "slug": "vdbs"},
-	{"label": "Texture",   "slug": "texture"},
-	{"label": "Shaders",   "slug": "shaders"},
 ]
 
 const SUBCATEGORIES := {

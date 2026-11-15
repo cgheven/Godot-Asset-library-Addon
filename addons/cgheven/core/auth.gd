@@ -111,7 +111,7 @@ func start_login(register := false) -> void:
 		return
 	# Build the SAME broker URL the Blender/AE addons use, so the website handles it
 	# identically: /addon-login?redirect=<loopback>&state=&addon=godot&machine=&label=
-	_state = "%08x%08x" % [randi(), randi()]
+	_state = Crypto.new().generate_random_bytes(16).hex_encode()   # unguessable (was randi())
 	var redirect := CghConfig.loopback_redirect(_port)
 	var label := _device_label()
 	var url := "%s?redirect=%s&state=%s&addon=%s&machine=%s&label=%s" % [
@@ -181,6 +181,14 @@ func _poll_login() -> void:
 		var req: String = str(slot["req"])
 		if req.find("\r\n") != -1:
 			var code := _extract_query_param(req, "code")
+			var got_state := _extract_query_param(req, "state")
+			if code != "" and got_state != "" and got_state != _state:
+				# A callback that carries a different login state is not ours (forged / stale): ignore it,
+				# never sign the user in with it. (A missing state is tolerated for older broker pages.)
+				_answer_and_close(peer, "")
+				_peers.remove_at(i)
+				i -= 1
+				continue
 			if code != "":
 				_answer_and_close(peer, code)   # 302 -> branded cgheven.com/addon-login/done page
 				_peers.remove_at(i)
