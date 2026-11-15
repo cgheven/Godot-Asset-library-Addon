@@ -19,6 +19,21 @@ const RES_SOURCES := "res://CGHEVEN/_sources"   # optional source copies; ALWAYS
 # first (used to pick the best model inside a zip, like the Blender addon's priority).
 const EDITOR_MODEL_PRIORITY := ["glb", "gltf", "fbx", "dae", "obj"]
 
+## The scene to import into. When the user has an EMPTY scene tab (no root node yet) the old code gave up and
+## the model never reached the viewport; now a Node3D root is created for them (undoable like any edit).
+## Returns null only when no scene tab exists at all.
+static func ensure_scene_root() -> Node:
+	var root := EditorInterface.get_edited_scene_root()
+	if root != null:
+		return root
+	var n := Node3D.new()
+	n.name = "CGHEVEN_Scene"
+	EditorInterface.add_root_node(n)
+	root = EditorInterface.get_edited_scene_root()
+	if root == null:
+		n.free()                   # no open scene tab to put it in
+	return root
+
 static func import_file(path: String, category_slug: String) -> String:
 	var ext := path.get_extension().to_lower()
 
@@ -91,7 +106,7 @@ static func _import_fbx(path: String) -> Node:
 	if doc.append_from_file(path, state) != OK:
 		return null
 	var root := doc.generate_scene(state)
-	var edited := EditorInterface.get_edited_scene_root()
+	var edited := ensure_scene_root()
 	if edited and root:
 		edited.add_child(root)
 		root.owner = edited

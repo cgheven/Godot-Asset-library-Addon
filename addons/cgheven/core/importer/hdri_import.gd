@@ -27,7 +27,7 @@ static func apply_as_world(exr_path: String) -> WorldEnvironment:
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 	env.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
 
-	var edited := EditorInterface.get_edited_scene_root()
+	var edited := CghImportRouter.ensure_scene_root()
 	if edited == null:
 		push_warning("[CGHEVEN] No open scene — WorldEnvironment created but not added.")
 		var orphan := WorldEnvironment.new()

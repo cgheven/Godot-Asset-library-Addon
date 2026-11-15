@@ -1,0 +1,7 @@
+# The Godot Asset Library installs the GitHub archive of a commit. Keep it to the addon only
+# (addons/cgheven already carries its own README and LICENSE).
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/README.md export-ignore
+/icon.png export-ignore
+/LICENSE export-ignore

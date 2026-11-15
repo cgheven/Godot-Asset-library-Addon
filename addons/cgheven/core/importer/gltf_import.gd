@@ -14,7 +14,7 @@ static func import_into_scene(glb_path: String) -> Node:
 	if scene_root == null:
 		push_error("[CGHEVEN] glTF generate_scene returned null")
 		return null
-	var edited := EditorInterface.get_edited_scene_root()
+	var edited := CghImportRouter.ensure_scene_root()
 	if edited == null:
 		push_warning("[CGHEVEN] No open scene to import into.")
 		return scene_root

@@ -71,9 +71,24 @@ static func _cat_attrs(asset: Dictionary) -> Dictionary:
 			return da
 	return {}
 
-static func category_slug(asset: Dictionary) -> String:
+static func _raw_category_slug(asset: Dictionary) -> String:
 	var da := _cat_attrs(asset)
 	return str(da.get("Slug", da.get("slug", "")))
+
+## Some flipbooks are filed under the VFX category in the CMS (their title says "Flipbook"). Treated by their
+## category alone they would be labelled "VFX", skip the flipbook hover/PNG-preference/EXR-fallback logic and,
+## worst, an EXR sheet would be imported as an HDRI sky. So: a "Flipbook" title outside the flipbook / HDRI /
+## 3D categories counts as a flipbook everywhere.
+static func _misfiled_flipbook(asset: Dictionary) -> bool:
+	var s := _raw_category_slug(asset).to_lower()
+	if s.contains("flipbook") or s.contains("hdr") or s.contains("model"):
+		return false
+	return title(asset).to_lower().contains("flipbook")
+
+static func category_slug(asset: Dictionary) -> String:
+	if _misfiled_flipbook(asset):
+		return "flipbooks"
+	return _raw_category_slug(asset)
 
 ## True when this asset is a flipbook. CRITICAL: the category slug may be the PARENT
 ## ("flipbooks") OR a SUBCATEGORY ("fire-flipbooks", "muzzle-flashes-flipbooks",
@@ -105,6 +120,8 @@ static func web_url(asset: Dictionary) -> String:
 	return CghConfig.web_base() + "/assets/" + id(asset)
 
 static func category_title(asset: Dictionary) -> String:
+	if _misfiled_flipbook(asset):
+		return "Flipbooks"
 	var da := _cat_attrs(asset)
 	var t := str(da.get("Title", da.get("Name", "")))
 	return t if t != "" else "Asset"
@@ -287,6 +304,14 @@ static func importable_entries(asset: Dictionary) -> Array:
 ## the lowest available resolution (e.g. 4K is free on a 4K/8K-only asset).
 static func has_free_file(asset: Dictionary) -> bool:
 	for e in file_entries(asset):
+		if not e["locked"]:
+			return true
+	return false
+
+## True when the asset has at least one UNLOCKED file Godot can actually import (not just any unlocked
+## file: a free .rar / video would otherwise count as "free" and then import nothing). Used by "Free only".
+static func has_free_importable(asset: Dictionary) -> bool:
+	for e in importable_entries(asset):
 		if not e["locked"]:
 			return true
 	return false

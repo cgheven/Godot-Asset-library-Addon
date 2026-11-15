@@ -54,6 +54,7 @@ var _search_debounce: Timer     # fires the search ~0.3s after the user stops ty
 var _last_total := 0            # total matching assets from the last server response (for the count line)
 var _sort_param := "createdAt:desc"
 var _loading := false
+var _auto_skip := 0   # pages skipped in a row because "Free only" left them empty (capped)
 var _spinner_box: CenterContainer   # loading animation, visible while a fetch is in flight
 const _Spinner := preload("res://addons/cgheven/ui/spinner.gd")
 var _thumb_ctx := {}     # HTTPRequest -> {card, url} | null when that slot is free
@@ -633,6 +634,7 @@ func _apply_search() -> void:
 	_load_first_page()
 
 func _load_first_page(force := false) -> void:
+	_auto_skip = 0
 	_page = 1
 	_page_count = 1        # reset so a stale multi-page bar never lingers over the new results
 	_thumb_fail = 0
@@ -714,6 +716,7 @@ func _show_sync_dialog(recs: Array) -> void:
 func _goto_page(p: int) -> void:
 	if p == _page or _loading or _filter_mode == 3:
 		return
+	_auto_skip = 0
 	_page = p
 	_clear_grid()
 	if _scroll:
@@ -778,7 +781,7 @@ func _render_assets(assets: Array, meta: Dictionary) -> void:
 	for a in assets:
 		if CghAsset.importable_entries(a).is_empty():
 			continue   # nothing Godot can import in this asset (rar / video / blend only): don't offer it
-		if _filter_mode == 1 and not CghAsset.has_free_file(a):
+		if _filter_mode == 1 and not CghAsset.has_free_importable(a):
 			continue
 		if _filter_mode == 2 and not CghDownloads.is_downloaded(a):
 			continue
@@ -788,6 +791,14 @@ func _render_assets(assets: Array, meta: Dictionary) -> void:
 	_last_total = int(pg.get("total", _grid.get_child_count())) if pg is Dictionary else _grid.get_child_count()
 	var q := _search_text.strip_edges()
 	var shown := _grid.get_child_count()
+	if shown == 0 and _filter_mode == 1 and _page < _page_count and _auto_skip < 10:
+		# "Free only" filters the page the server sent. When that whole page is locked, don't leave the user
+		# on an empty screen: quietly move on to the next page until something free shows up.
+		_auto_skip += 1
+		_page += 1
+		_clear_grid()
+		_fetch()
+		return
 	if shown == 0:
 		var empty := "No results found."
 		if q != "":
@@ -817,7 +828,7 @@ func _render_page_bar() -> void:
 		c.queue_free()
 	# Only show pages when there are actually cards below them — never float a "1 2 3 …"
 	# bar over an empty/short result (this is what made pages seem to sit "at the top").
-	if _filter_mode == 3 or _page_count <= 1 or _grid.get_child_count() == 0:
+	if _filter_mode == 3 or _page_count <= 1 or (_grid.get_child_count() == 0 and _filter_mode != 1):
 		_page_bar.visible = false
 		return
 	_page_bar.visible = true
@@ -958,8 +969,7 @@ func _on_thumb(result: int, code: int, _h: PackedStringArray, body: PackedByteAr
 			# One collapsed endpoint ("cdn:thumbnail") so a bad CDN day dedupes to ONE event, not one per image.
 			var thumb_ok_http := result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300
 			CghAnalytics.api_error("cdn:thumbnail", 0 if thumb_ok_http else code, "thumbnail decode failed" if thumb_ok_http else "thumbnail request failed (result %d)" % result, 0 if thumb_ok_http else result)
-			if _thumb_fail == 1:
-				_set_status("Thumbnail failed: result=%d http=%d (send me this)" % [result, code], true)
+			# (no on-screen message: a missing thumbnail must not overwrite the asset count line; it is logged + tracked)
 			push_warning("CGHEVEN: thumbnail failed (result=%d http=%d) %s" % [result, code, str(ctx.get("url", ""))])
 	_pump_thumbs()                         # start the next queued thumbnail
 
@@ -1208,7 +1218,7 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 			_report("Model saved to %s — drag it from FileSystem into your scene." % res_path, true)
 			_track_import_result(asset, ext, true)
 		return
-	var root := EditorInterface.get_edited_scene_root()
+	var root := CghImportRouter.ensure_scene_root()
 	if root == null:
 		_report("Model imported to %s — open a 3D scene, then drag it in." % res_path, true)
 		_track_import_result(asset, ext, true)

@@ -8,7 +8,7 @@ class_name CghConfig
 # Backend endpoints (override via OS env for dev, like the desktop addons)
 # ---------------------------------------------------------------------------
 const ADDON_SLUG := "godot"
-const ADDON_VERSION := "1.0.0"
+const ADDON_VERSION := "1.1.0"
 
 # Distribution channel tag (build-time). Lets PostHog split installs by where the
 # user got the addon (website / godot_asset_library / adobe_exchange / …).

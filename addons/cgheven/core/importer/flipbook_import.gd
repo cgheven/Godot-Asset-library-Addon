@@ -31,7 +31,7 @@ static func from_sheet(sheet_path: String, h_frames: int, v_frames: int, fps := 
 	spr.billboard = BaseMaterial3D.BILLBOARD_ENABLED           # face the camera (VFX)
 	spr.alpha_cut = SpriteBase3D.ALPHA_CUT_DISABLED            # default = alpha blend
 
-	var edited := EditorInterface.get_edited_scene_root()
+	var edited := CghImportRouter.ensure_scene_root()
 	if edited == null:
 		push_warning("[CGHEVEN] No open scene — flipbook node created but not added. Open a scene and re-import.")
 		return spr
