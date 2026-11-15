@@ -40,6 +40,14 @@ static func thumbnail(asset: Dictionary) -> String:
 			url = str(t.get("url", ""))
 	return _normalize_media_url(url)
 
+## Grid thumbnail: the CMS keeps a ~4-5x lighter mobile variant for many assets - use it when present,
+## otherwise fall back to the normal thumbnail. (The hover/preview views still use the full images.)
+static func thumbnail_small(asset: Dictionary) -> String:
+	var m = attrs(asset).get("thumbnail_mobile_url", "")
+	if m is String and m.strip_edges() != "":
+		return _normalize_media_url(m)
+	return thumbnail(asset)
+
 static func _normalize_media_url(url: String) -> String:
 	var raw := url.strip_edges()
 	if raw == "":

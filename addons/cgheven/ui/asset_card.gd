@@ -463,7 +463,7 @@ func set_thumbnail(tex: Texture2D) -> void:
 		_thumb_base = tex
 
 func get_thumb_url() -> String:
-	return CghAsset.thumbnail(asset)
+	return CghAsset.thumbnail_small(asset)
 
 # ---------------- hover preview (image slideshow; Godot can't play mp4) ----------------
 func _on_enter() -> void:

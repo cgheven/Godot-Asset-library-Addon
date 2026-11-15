@@ -41,7 +41,7 @@ var _subcat_items: Array = []   # popup id -> subcategory slug ("" = All)
 var _logo: TextureRect
 
 var _page := 1
-var _page_size := 25
+var _page_size := 16
 var _category := ""
 var _subcat := ""
 var _subcats_by_parent := {}   # parent slug -> [{label, slug}] from the live category API
@@ -54,6 +54,8 @@ var _search_debounce: Timer     # fires the search ~0.3s after the user stops ty
 var _last_total := 0            # total matching assets from the last server response (for the count line)
 var _sort_param := "createdAt:desc"
 var _loading := false
+var _spinner_box: CenterContainer   # loading animation, visible while a fetch is in flight
+const _Spinner := preload("res://addons/cgheven/ui/spinner.gd")
 var _thumb_ctx := {}     # HTTPRequest -> {card, url} | null when that slot is free
 var _thumb_queue := []   # pending [{card, url}] (loads 4 at a time)
 var _thumb_fail := 0     # consecutive thumbnail download failures (offline detection)
@@ -83,7 +85,7 @@ func boot() -> void:
 	# wire services
 	api.assets_loaded.connect(_on_assets_loaded)
 	api.categories_loaded.connect(_on_categories_loaded)
-	api.request_failed.connect(func(m): _set_status(m, true); _loading = false)
+	api.request_failed.connect(func(m): _set_status(m, true); _set_loading(false))
 	auth.logged_in.connect(_on_logged_in)
 	auth.login_failed.connect(func(m): _set_status(m, true))
 	auth.plan_refreshed.connect(_on_plan_refreshed)
@@ -187,6 +189,13 @@ func _build_ui() -> void:
 	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	col.add_theme_constant_override("separation", 8)
 	_scroll.add_child(col)
+
+	# Loading animation: shown while assets are being fetched, hidden as soon as they arrive.
+	_spinner_box = CenterContainer.new()
+	_spinner_box.custom_minimum_size = Vector2(0, 200)
+	_spinner_box.visible = false
+	_spinner_box.add_child(_Spinner.new())
+	col.add_child(_spinner_box)
 
 	_grid = GridContainer.new()
 	_grid.columns = 2
@@ -741,17 +750,23 @@ func _fetch(force := false) -> void:
 		var page := CghCache.load_page(auth.plan, _cache_key())
 		var cached_assets = page.get("assets", [])
 		if cached_assets is Array and not cached_assets.is_empty():
-			_loading = false
+			_set_loading(false)
 			_render_assets(cached_assets, page.get("meta", {}))
 			return
-	_loading = true
+	_set_loading(true)
 	_set_status(("Searching “%s”…" % _search_text.strip_edges()) if _search_text.strip_edges() != "" else "Loading…", false)
 	# Pass category + subcategory separately: a subcategory filters the `subcategories`
 	# relation, a category filters `categorie` (different Strapi filters).
 	api.fetch_assets(_page, _page_size, _category, _search_text, _sort_param, _subcat, _tab_slugs())
 
+# _loading + the spinner always change together.
+func _set_loading(on: bool) -> void:
+	_loading = on
+	if _spinner_box != null:
+		_spinner_box.visible = on
+
 func _on_assets_loaded(assets: Array, meta: Dictionary) -> void:
-	_loading = false
+	_set_loading(false)
 	if _filter_mode == 3:   # Favorites view doesn't use fetched results
 		return
 	CghCache.save_assets(auth.plan, _cache_key(), assets, meta)
@@ -919,12 +934,24 @@ func _on_thumb(result: int, code: int, _h: PackedStringArray, body: PackedByteAr
 		var img: Image = null
 		if result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300:
 			img = _decode_image(body, ctx["url"])
+			if img != null and maxi(img.get_width(), img.get_height()) > 512:
+				# cards are ~160px wide: a 1024px texture only costs GPU memory and PNG-save time
+				var k := 512.0 / float(maxi(img.get_width(), img.get_height()))
+				img.resize(maxi(1, int(img.get_width() * k)), maxi(1, int(img.get_height() * k)), Image.INTERPOLATE_BILINEAR)
 		if img != null:
 			_thumb_fail = 0
 			if is_instance_valid(ctx["card"]):
 				ctx["card"].set_thumbnail(ImageTexture.create_from_image(img))
 			CghCache.save_thumb(ctx["url"], img)
 		else:
+			# The light variant failed: retry ONCE with the normal thumbnail before reporting anything.
+			var fcard = ctx.get("card", null)
+			if is_instance_valid(fcard) and not bool(ctx.get("fallback", false)):
+				var full: String = CghAsset.thumbnail(fcard.asset)
+				if full != "" and full != str(ctx.get("url", "")):
+					_thumb_queue.push_back({"card": fcard, "url": full, "fallback": true})
+					_pump_thumbs()
+					return
 			# Network/decoder failure — surface the exact result/http in the panel
 			# (result=4 connection/offline, http=403/404 CDN, http=200 = decode issue).
 			_thumb_fail += 1
