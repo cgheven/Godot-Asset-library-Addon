@@ -12,13 +12,14 @@ signal update_failed(message: String)
 
 var _check_http: HTTPRequest
 var _dl: CghDownloader
+var _chk_t0 := 0   # ticks: update-check request start (api_call_performance)
 
 func _ready() -> void:
 	_check_http = HTTPRequest.new(); add_child(_check_http)
 	_check_http.request_completed.connect(_on_check)
 	_dl = CghDownloader.new(); add_child(_dl)
 	_dl.finished.connect(_on_zip_downloaded)
-	_dl.failed.connect(func(m): update_failed.emit(m))
+	_dl.failed.connect(_on_dl_failed)
 
 func check() -> void:
 	# Backend contract: POST /api/addon-updates/check with body {addon_slug,
@@ -28,16 +29,28 @@ func check() -> void:
 		"addon_slug": CghConfig.ADDON_SLUG,
 		"current_version": CghConfig.ADDON_VERSION,
 	})
-	_check_http.request(CghConfig.check_update_url(),
+	_chk_t0 = Time.get_ticks_msec()
+	var req_err := _check_http.request(CghConfig.check_update_url(),
 		PackedStringArray(["Content-Type: application/json"]),
 		HTTPClient.METHOD_POST, body)
+	if req_err != OK:
+		CghAnalytics.update_failed("check_start", "Update check could not start (err %d)" % req_err, CghConfig.ADDON_VERSION)
 
-func _on_check(_r: int, code: int, _h: PackedStringArray, b: PackedByteArray) -> void:
+# The downloader's own failure -> update_failed (with the download details it recorded).
+func _on_dl_failed(m: String) -> void:
+	CghAnalytics.update_failed("download", m, CghConfig.ADDON_VERSION)
+	update_failed.emit(m)
+
+func _on_check(r: int, code: int, _h: PackedStringArray, b: PackedByteArray) -> void:
+	CghAnalytics.api_call_performance(CghConfig.check_update_url(), Time.get_ticks_msec() - _chk_t0, code >= 200 and code < 300, code)
 	if code < 200 or code >= 300:
+		CghAnalytics.api_error(CghConfig.check_update_url(), code, "Update check failed (HTTP %d)" % code, r, CghAnalytics.body_text(b, code))
+		CghAnalytics.update_failed("check", "Update check failed (HTTP %d, result %d)" % [code, r], CghConfig.ADDON_VERSION)
 		update_failed.emit("Update check failed (HTTP %d)" % code)
 		return
 	var d = JSON.parse_string(b.get_string_from_utf8())
 	if typeof(d) != TYPE_DICTIONARY:
+		CghAnalytics.update_failed("check", "Bad update response", CghConfig.ADDON_VERSION)
 		update_failed.emit("Bad update response")
 		return
 	if d.get("update_available", false):
@@ -49,6 +62,7 @@ func _on_check(_r: int, code: int, _h: PackedStringArray, b: PackedByteArray) ->
 		if url == "":
 			# Update exists but no ZIP uploaded to the release yet — don't prompt a
 			# download that can't complete; surface only on a manual check.
+			CghAnalytics.update_failed("no_download", "Update %s available but no download is published" % ver, CghConfig.ADDON_VERSION, ver)
 			update_failed.emit("Update %s available, but no download is published yet." % ver)
 			return
 		update_available.emit(ver, notes, url)
@@ -61,6 +75,7 @@ func download_and_stage(url: String) -> void:
 func _on_zip_downloaded(zip_path: String) -> void:
 	var reader := ZIPReader.new()
 	if reader.open(zip_path) != OK:
+		CghAnalytics.update_failed("open_zip", "Could not open update zip", CghConfig.ADDON_VERSION)
 		update_failed.emit("Could not open update zip")
 		return
 	var base := "res://addons/cgheven/"
@@ -78,5 +93,7 @@ func _on_zip_downloaded(zip_path: String) -> void:
 		if f:
 			f.store_buffer(reader.read_file(entry))
 			f.close()
+		else:
+			CghAnalytics.update_failed("write_file", "Could not write %s (err %d)" % [rel, FileAccess.get_open_error()], CghConfig.ADDON_VERSION)
 	reader.close()
 	update_ready_to_restart.emit()   # caller shows "Restart editor?" dialog -> EditorInterface.restart_editor()

@@ -83,6 +83,15 @@ func build() -> void:
 	note.add_theme_font_size_override("font_size", 9)
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(note)
+
+	# Keep a reference copy of flipbook / HDRI sources inside the user's project? Off by default.
+	var keep := CheckBox.new()
+	keep.text = "Keep source copy in my project"
+	keep.tooltip_text = "Off (recommended): sources stay outside your project, so they can't bloat your game.\nOn: a copy is saved to res://CGHEVEN/_sources/, which is never included when you export."
+	keep.button_pressed = CghConfig.keep_project_copy()
+	keep.add_theme_font_size_override("font_size", 10)
+	keep.toggled.connect(func(on: bool): CghConfig.set_keep_project_copy(on))
+	v.add_child(keep)
 	_gap(v)
 
 	# ---------- Community ----------

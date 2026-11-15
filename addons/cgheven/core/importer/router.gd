@@ -12,6 +12,7 @@ class_name CghImportRouter
 ## the user can find / reuse it (Godot only imports files that live under res://).
 
 const RES_ROOT := "res://CGHEVEN"
+const RES_SOURCES := "res://CGHEVEN/_sources"   # optional source copies; ALWAYS excluded from exports
 
 # Model formats Godot's EDITOR can import (into a PackedScene, or a Mesh for .obj) — far
 # more than the runtime GLTFDocument path, which only handles glTF. Order = most reliable
@@ -47,15 +48,18 @@ static func import_file(path: String, category_slug: String) -> String:
 	elif ext in CghConfig.EXT_IMAGE:
 		msg = _do_flipbook(path)
 	else:
-		# Not auto-importable — still drop it in the project so the user has it.
-		var rp0 := copy_into_project(path, cat)
-		return "Saved to %s (no auto-import for .%s)." % [rp0, ext] if rp0 != "" else \
-			"Downloaded to %s (no auto-import for .%s)." % [path, ext]
+		# Godot can't import this format (video, archive, VDB ...). It used to be copied into the
+		# user's project anyway, where it did nothing except bloat the exported game. Leave it in the
+		# downloads folder, outside the project.
+		return "Downloaded to %s. Godot can't import .%s, so it stays OUTSIDE your project (no extra weight in your game)." % [path, ext]
 
-	# Copy a reusable source into the project (FileSystem dock) and tell the user.
-	var rp := copy_into_project(path, cat)
-	if rp != "":
-		msg += " Saved in %s/" % rp.get_base_dir()
+	# The scene already holds the asset (the texture / sky was built in memory), so the raw source does
+	# NOT need to live in the user's project. Only keep a copy when the user asked for it, and put it
+	# in an export-excluded folder so a 4K sheet / EXR can never end up in an exported game.
+	if CghConfig.keep_project_copy():
+		var rp := copy_source_to_project(path, cat)
+		if rp != "":
+			msg += " Source copy kept in %s/ (never included when you export)." % rp.get_base_dir()
 	return msg
 
 # ---------------- per-type importers ----------------
@@ -113,6 +117,35 @@ static func copy_into_project(path: String, category_slug: String) -> String:
 	f.store_buffer(bytes)
 	f.close()
 	# Make the editor pick up + import the new file so it shows in the dock.
+	if Engine.is_editor_hint():
+		var efs := EditorInterface.get_resource_filesystem()
+		if efs and not efs.is_scanning():
+			efs.scan()
+	return dest
+
+## OPTIONAL source copy (Settings > "Keep source copy in my project"). It lives in
+## res://CGHEVEN/_sources/, which the CGHEVEN export plugin always skips, so a large sheet / EXR kept
+## here for reference can never end up in an exported game. Returns the res:// path, or "".
+static func copy_source_to_project(path: String, category_slug: String) -> String:
+	var sub := category_slug if category_slug != "" else "assets"
+	var dir := RES_SOURCES.path_join(sub)
+	DirAccess.make_dir_recursive_absolute(dir)
+	var readme := RES_SOURCES.path_join("README.txt")
+	if not FileAccess.file_exists(readme):
+		var rf := FileAccess.open(readme, FileAccess.WRITE)
+		if rf:
+			rf.store_string("CGHEVEN source copies.\n\nEverything in this folder is EXCLUDED when you export your game (the CGHEVEN plugin skips it),\nso large sheets / EXR files kept here for reference never add weight to your build.\nDrag a file out of this folder into your own folder if you want to use it in your game.\n")
+			rf.close()
+	var dest := dir.path_join(CghConfig.safe_download_name(path.get_file()))
+	if DirAccess.copy_absolute(path, dest) != OK:
+		var bytes := FileAccess.get_file_as_bytes(path)
+		if bytes.is_empty():
+			return ""
+		var f := FileAccess.open(dest, FileAccess.WRITE)
+		if f == null:
+			return ""
+		f.store_buffer(bytes)
+		f.close()
 	if Engine.is_editor_hint():
 		var efs := EditorInterface.get_resource_filesystem()
 		if efs and not efs.is_scanning():

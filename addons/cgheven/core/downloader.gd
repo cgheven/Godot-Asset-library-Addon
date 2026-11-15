@@ -13,6 +13,14 @@ var _active := false
 var _dest := ""
 var _last_got := 0      # bytes seen last frame — to detect a dead/stalled connection
 var _stall := 0.0       # seconds with zero new bytes
+# Details of the LAST failure (read by the dock for error tracking right after `failed` fires).
+var last_stage := ""
+var last_status := 0
+var last_result := 0
+var last_duration_ms := 0   # of the last SUCCESSFUL download (download_performance)
+var last_bytes := 0
+var _t0_msec := 0
+var last_body := ""     # server's error text (first 200 chars, scrubbed) for HTTP >= 400
 const STALL_LIMIT := 30.0   # a hung download must not block every later one forever
 
 func _ready() -> void:
@@ -22,7 +30,9 @@ func _ready() -> void:
 	_http.request_completed.connect(_on_done)
 
 func download(url: String, filename: String, headers := PackedStringArray()) -> void:
+	last_body = ""
 	if _active:
+		last_stage = "busy"; last_status = 0; last_result = 0
 		failed.emit("A download is already in progress.")
 		return
 	CghConfig.ensure_dirs()
@@ -36,9 +46,11 @@ func download(url: String, filename: String, headers := PackedStringArray()) -> 
 	_http.download_file = _dest
 	var err := _http.request(url, headers, HTTPClient.METHOD_GET)
 	if err != OK:
+		last_stage = "start"; last_status = 0; last_result = 0
 		failed.emit("Download could not start (err %d)" % err)
 		return
 	_active = true
+	_t0_msec = Time.get_ticks_msec()
 	_last_got = 0
 	_stall = 0.0
 	set_process(true)
@@ -60,12 +72,21 @@ func _process(dt: float) -> void:
 			_http.cancel_request()
 			_active = false
 			set_process(false)
+			last_stage = "stalled"; last_status = 0; last_result = 0
 			failed.emit("Download stalled (no data for %ds) — check your connection and retry." % int(STALL_LIMIT))
 			return
 	if total > 0:
 		progress.emit(float(got) / float(total) * 100.0, got, total)
 	else:
 		progress.emit(-1.0, got, -1)     # indeterminate -> spinner
+
+func _read_head(path: String) -> PackedByteArray:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return PackedByteArray()
+	var head := f.get_buffer(2048)
+	f.close()
+	return head
 
 func cancel() -> void:
 	if _active:
@@ -77,6 +98,12 @@ func _on_done(result: int, code: int, _h: PackedStringArray, _b: PackedByteArray
 	_active = false
 	set_process(false)
 	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
+		last_stage = "http" if result == HTTPRequest.RESULT_SUCCESS else "network"
+		last_status = code
+		last_result = result
+		# download_file is set, so the error body (if any) was written INTO the file — read its head.
+		if code >= 400:
+			last_body = CghAnalytics.body_text(_read_head(_dest), code)
 		var hint := ""
 		if code == 401 or code == 403:
 			hint = " — access denied (file link may be expired/invalid on the server)"
@@ -86,5 +113,11 @@ func _on_done(result: int, code: int, _h: PackedStringArray, _b: PackedByteArray
 			hint = " — network/connection issue"
 		failed.emit("Download failed for %s%s [result %d, HTTP %d]" % [_dest.get_file(), hint, result, code])
 		return
+	last_duration_ms = Time.get_ticks_msec() - _t0_msec
+	last_bytes = 0
+	var sf := FileAccess.open(_dest, FileAccess.READ)
+	if sf != null:
+		last_bytes = int(sf.get_length())
+		sf.close()
 	CghDownloads.mark_saved(_dest.get_file())
 	finished.emit(_dest)

@@ -11,11 +11,17 @@ class_name CghAuth
 signal logged_in(plan: String)
 signal login_failed(message: String)
 signal plan_refreshed(plan: String)
+signal session_refreshed()                  # heartbeat renewed the 24h token (plan unchanged)
+signal session_expired(reason: String)      # server rejected the session -> user was signed out
 
 var session_token := ""
 var plan := "Free"
 var email := ""
 var expires_at := ""   # ISO date the plan/session expires (shown in the Account popup)
+var _xt0 := 0   # ticks: exchange/activate request start (api_call_performance)
+var _hb_t0 := 0
+var startup_notice := ""   # set when the saved session was already expired at launch (UI shows it once)
+var _login_method := "account"   # for error tracking: "account" (web broker) or "license_key"
 
 var _server: TCPServer
 var _port := 0
@@ -32,6 +38,7 @@ func _ready() -> void:
 	_heartbeat_http = HTTPRequest.new(); add_child(_heartbeat_http)
 	_heartbeat_http.request_completed.connect(_on_heartbeat_done)
 	_load_session()
+	_drop_if_expired()
 
 # -------- persisted session (EditorSettings, per-user, cross-project) --------
 func _load_session() -> void:
@@ -41,6 +48,34 @@ func _load_session() -> void:
 		plan = es.get_setting("cgheven/plan") if es.has_setting("cgheven/plan") else "Free"
 		email = es.get_setting("cgheven/email") if es.has_setting("cgheven/email") else ""
 		expires_at = es.get_setting("cgheven/expires_at") if es.has_setting("cgheven/expires_at") else ""
+
+# The session JWT lives 24h and heartbeat can only renew a LIVE token. If the saved one is
+# already dead, drop it NOW; otherwise the addon would show "Pro" and then fail every request
+# with 401. The user simply has to log in again (same as the Blender addon).
+func _drop_if_expired() -> void:
+	if session_token == "":
+		return
+	var token_exp := _jwt_exp(session_token)
+	if token_exp > 0 and token_exp < int(Time.get_unix_time_from_system()):
+		session_token = ""
+		plan = "Free"
+		email = ""
+		expires_at = ""
+		_save_session()
+		startup_notice = "Your CGHEVEN login expired. Please log in again to use your Pro plan."
+
+# Reads the `exp` (unix seconds) claim of a JWT without verifying it. 0 = unknown/unreadable.
+static func _jwt_exp(token: String) -> int:
+	var parts := token.split(".")
+	if parts.size() != 3:
+		return 0
+	var seg: String = parts[1].replace("-", "+").replace("_", "/")
+	while seg.length() % 4 != 0:
+		seg += "="
+	var d = JSON.parse_string(Marshalls.base64_to_utf8(seg))
+	if typeof(d) != TYPE_DICTIONARY:
+		return 0
+	return int(d.get("exp", 0))
 
 func _save_session() -> void:
 	var es := EditorInterface.get_editor_settings()
@@ -71,6 +106,7 @@ func start_login(register := false) -> void:
 			_port = p
 			break
 	if _port == 0:
+		CghAnalytics.login_failed("Could not open a local login port", 0, "account")
 		login_failed.emit("Could not open a local login port. Close other addons and retry.")
 		return
 	# Build the SAME broker URL the Blender/AE addons use, so the website handles it
@@ -189,6 +225,7 @@ func _finish_login(code: String) -> void:
 		_server.stop()
 	_stop_poll()
 	if code == "":
+		CghAnalytics.login_failed("No login code received", 0, "account")
 		login_failed.emit("No login code received. Please try logging in again.")
 		return
 	_exchange_code(code)
@@ -212,18 +249,25 @@ func _extract_query_param(req: String, key: String) -> String:
 	return ""
 
 func _exchange_code(code: String) -> void:
+	_login_method = "account"
+	_xt0 = Time.get_ticks_msec()
 	# Redeem the handoff code for the session payload (same as Blender/AE).
 	var body := JSON.stringify({"code": code})
 	_exchange_http.request(CghConfig.addon_exchange_url(),
 		PackedStringArray(["Content-Type: application/json"]),
 		HTTPClient.METHOD_POST, body)
 
-func _on_exchange_done(_r: int, code_status: int, _h: PackedStringArray, b: PackedByteArray) -> void:
+func _on_exchange_done(r: int, code_status: int, _h: PackedStringArray, b: PackedByteArray) -> void:
+	var ep := CghConfig.addon_activate_url() if _login_method == "license_key" else CghConfig.addon_exchange_url()
+	CghAnalytics.api_call_performance(ep, Time.get_ticks_msec() - _xt0, code_status >= 200 and code_status < 300, code_status)
 	if code_status < 200 or code_status >= 300:
+		CghAnalytics.api_error(ep, code_status, "Login exchange failed (HTTP %d, result %d)" % [code_status, r], r, CghAnalytics.body_text(b, code_status))
+		CghAnalytics.login_failed("Login exchange failed (HTTP %d, result %d)" % [code_status, r], code_status, _login_method, CghAnalytics.body_text(b, code_status))
 		login_failed.emit("Login exchange failed (HTTP %d)" % code_status)
 		return
 	var d = JSON.parse_string(b.get_string_from_utf8())
 	if typeof(d) != TYPE_DICTIONARY or not d.has("session_token"):
+		CghAnalytics.login_failed("Login exchange returned no token", code_status, _login_method)
 		login_failed.emit("Login exchange returned no token.")
 		return
 	session_token = d["session_token"]
@@ -250,6 +294,8 @@ func _plan_name_from(d: Dictionary) -> String:
 
 # -------------------------- license-key activation --------------------------
 func activate_key(key: String) -> void:
+	_login_method = "license_key"
+	_xt0 = Time.get_ticks_msec()
 	var body := JSON.stringify({
 		"license_key": key,
 		"machine_hash": machine_hash(),
@@ -264,20 +310,66 @@ func activate_key(key: String) -> void:
 func heartbeat() -> void:
 	if session_token == "":
 		return
+	_hb_t0 = Time.get_ticks_msec()
+	# POST: the backend route only exists as POST /api/addon-license/heartbeat (a GET is a 404/405).
 	_heartbeat_http.request(CghConfig.heartbeat_url(),
-		PackedStringArray(["Authorization: Bearer " + session_token]),
-		HTTPClient.METHOD_GET)
+		PackedStringArray(["Content-Type: application/json", "Authorization: Bearer " + session_token]),
+		HTTPClient.METHOD_POST, JSON.stringify({"machine_hash": machine_hash()}))
 
-func _on_heartbeat_done(_r: int, code_status: int, _h: PackedStringArray, b: PackedByteArray) -> void:
-	if code_status < 200 or code_status >= 300:
+func _on_heartbeat_done(r: int, code_status: int, _h: PackedStringArray, b: PackedByteArray) -> void:
+	CghAnalytics.api_call_performance(CghConfig.heartbeat_url(), Time.get_ticks_msec() - _hb_t0, code_status >= 200 and code_status < 300, code_status)
+	if code_status == 401 or code_status == 402 or code_status == 403:
+		# The server rejected this session (expired / revoked / license used on another device).
+		end_session(code_status, CghAnalytics.body_text(b, code_status))
 		return
+	if code_status < 200 or code_status >= 300:
+		if code_status >= 400:   # server-side failures only (an offline user would otherwise eat the event cap)
+			CghAnalytics.api_error(CghConfig.heartbeat_url(), code_status, "Heartbeat failed (HTTP %d, result %d)" % [code_status, r], r, CghAnalytics.body_text(b, code_status))
+		return   # 5xx / offline: keep the saved session
 	var d = JSON.parse_string(b.get_string_from_utf8())
-	if typeof(d) == TYPE_DICTIONARY and d.has("plan"):
+	if typeof(d) != TYPE_DICTIONARY:
+		return
+	var dirty := false
+	var token_changed := false
+	# Every heartbeat answer carries a fresh 24h token. SAVE it: this is the only token renewal
+	# there is, so a token we never store is a login that dies after 24 hours.
+	var tok := str(d.get("session_token", ""))
+	if tok != "" and tok != session_token:
+		session_token = tok
+		token_changed = true
+		dirty = true
+	var plan_changed := false
+	if d.has("plan"):
 		var new_plan := _plan_name_from(d)
 		if new_plan != plan:
 			plan = new_plan
-			_save_session()
-			plan_refreshed.emit(plan)
+			plan_changed = true
+			dirty = true
+	if d.has("expires_at"):
+		var ea = d.get("expires_at")
+		var new_exp := "" if ea == null else str(ea)
+		if new_exp != expires_at:
+			expires_at = new_exp
+			dirty = true
+	if dirty:
+		_save_session()
+	if plan_changed:
+		plan_refreshed.emit(plan)
+	elif token_changed:
+		session_refreshed.emit()
+
+## Called when the server rejects the saved session (heartbeat, or an asset/category request that
+## answered 401/402/403). Signs the user out cleanly and tells the UI why, so the addon never sits
+## there showing "Pro" while every request fails. Calling it twice is harmless (2nd call no-ops).
+func end_session(code: int, server_text := "") -> void:
+	if session_token == "":
+		return
+	var reason := "Your CGHEVEN login expired. Please log in again."
+	if (code == 402 or code == 403) and server_text.strip_edges() != "":
+		reason = server_text.strip_edges()   # e.g. "license is active on another device"
+	CghAnalytics.login_failed(reason, code, "session_rejected", server_text)
+	logout()
+	session_expired.emit(reason)
 
 # -------------------------- machine fingerprint (license-key path) --------------------------
 static func machine_hash() -> String:

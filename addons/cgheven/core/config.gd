@@ -61,7 +61,7 @@ static func addon_exchange_url() -> String:
 static func addon_activate_url() -> String:
 	return api_base() + "/api/addon-license/activate"
 static func heartbeat_url() -> String:
-	return api_base() + "/api/addon-updates/heartbeat"
+	return api_base() + "/api/addon-license/heartbeat"
 # Analytics goes through the backend (same as every desktop addon) so the PostHog
 # key stays server-side — the addon never ships a key.
 static func analytics_track_url() -> String:
@@ -125,6 +125,17 @@ static func set_custom_download_dir(p: String) -> void:
 	d["download_dir"] = p
 	_write_prefs(d)
 
+# Keep a reference copy of flipbook / HDRI sources INSIDE the user's project? Default OFF: the
+# scene already holds the asset, so a raw 4K sheet in res:// is dead weight (and used to ship
+# in exported games). When ON the copy goes to res://CGHEVEN/_sources/, which is export-excluded.
+static func keep_project_copy() -> bool:
+	return bool(_read_prefs().get("keep_project_copy", false))
+
+static func set_keep_project_copy(on: bool) -> void:
+	var d := _read_prefs()
+	d["keep_project_copy"] = on
+	_write_prefs(d)
+
 # ---------------------------------------------------------------------------
 # COLORS — exact hex from the After Effects addon (addon-ui-spec)
 # ---------------------------------------------------------------------------
@@ -166,15 +177,20 @@ const GRID_GAP  := 7
 #   vfx, 3d-models, hdri, flipbooks, vdbs, shaders, tutorials
 # Godot can usefully consume only: 3d-models, hdri, flipbooks.
 # vdbs / vfx(video) / tutorials / shaders are Blender-only and intentionally NOT listed.
+# Fallback tabs, used only until (or if) the live category list can't be loaded. The real tabs come
+# from the backend (/api/proxy/categories) - see CghMainDock._on_categories_loaded - so every
+# top-level category the library has shows up and new ones appear automatically.
 const CATEGORIES := [
 	{"label": "All",       "slug": ""},
 	{"label": "3D Models", "slug": "3d-models"},
 	{"label": "HDRI",      "slug": "hdri"},
 	{"label": "Flipbooks", "slug": "flipbooks"},
+	{"label": "VFX",       "slug": "vfx"},
+	{"label": "VDBs",      "slug": "vdbs"},
+	{"label": "Texture",   "slug": "texture"},
+	{"label": "Shaders",   "slug": "shaders"},
 ]
 
-# Subcategories per parent slug (from the Blender addon _PARENT_MAP).
-# Each subcategory is itself a backend category Slug; selecting one filters by it.
 const SUBCATEGORIES := {
 	"3d-models": [
 		{"label": "Furniture", "slug": "furniture"},

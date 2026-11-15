@@ -45,6 +45,9 @@ var _page_size := 25
 var _category := ""
 var _subcat := ""
 var _subcats_by_parent := {}   # parent slug -> [{label, slug}] from the live category API
+var _pills: Array = []          # the category tab buttons currently shown
+var _pill_flow: HFlowContainer  # wraps the tabs onto extra lines instead of widening the dock
+var _top_cats: Array = []       # [{label, slug}] shown as tabs (live from the API, hardcoded fallback)
 var _search_text := ""
 var _pending_search := ""       # last text typed; applied after a short debounce (live search)
 var _search_debounce: Timer     # fires the search ~0.3s after the user stops typing
@@ -64,10 +67,19 @@ func _init() -> void:
 	add_theme_stylebox_override("panel", CghTheme._box(CghConfig.C_BG, 0))
 
 func boot() -> void:
+	# Init sanity check (GDScript can't catch exceptions): a missing core service means the panel
+	# can't work at all — report it instead of failing silently on the first null access.
+	if api == null or auth == null or downloader == null or analytics == null or updater == null:
+		CghAnalytics.addon_open_failed("services_missing", "a core service was not created before boot")
+		return
 	CghConfig.ensure_dirs()
 	CghDownloads.rescan()   # cross-addon file scanner -> shared ✓ ticks
 	_build_ui()
 	_build_modals()
+	# Old "<zip>_unzip" extraction folders pile up (hundreds of MB): sweep them a few seconds after boot.
+	get_tree().create_timer(8.0).timeout.connect(_sweep_temp_extractions)
+	if _grid == null:
+		CghAnalytics.addon_open_failed("build_ui", "asset grid was not created")
 	# wire services
 	api.assets_loaded.connect(_on_assets_loaded)
 	api.categories_loaded.connect(_on_categories_loaded)
@@ -75,6 +87,9 @@ func boot() -> void:
 	auth.logged_in.connect(_on_logged_in)
 	auth.login_failed.connect(func(m): _set_status(m, true))
 	auth.plan_refreshed.connect(_on_plan_refreshed)
+	auth.session_refreshed.connect(_on_session_refreshed)
+	auth.session_expired.connect(_on_session_expired)
+	api.auth_rejected.connect(_on_auth_rejected)
 	downloader.progress.connect(_on_dl_progress)
 	downloader.finished.connect(_on_dl_finished)
 	downloader.failed.connect(_on_dl_failed)
@@ -118,6 +133,10 @@ func boot() -> void:
 	api.fetch_categories()
 	_refresh_account_ui()
 	analytics.identify(auth.email, auth.plan)
+	if auth.startup_notice != "":   # the saved login was already expired at launch
+		_set_status(auth.startup_notice, true)
+		_show_toast(auth.startup_notice, "error")
+		auth.startup_notice = ""
 	# addon_installed fires once ever (first run on this machine), like the desktop addons.
 	if not bool(CghConfig._read_prefs().get("installed_tracked", false)):
 		analytics.track("addon_installed")
@@ -399,19 +418,15 @@ func _build_searchrow() -> HBoxContainer:
 func _build_pills() -> HBoxContainer:
 	_pill_row = HBoxContainer.new()
 	_pill_row.add_theme_constant_override("separation", 4)
-	for cat in CghConfig.CATEGORIES:
-		var p := Button.new()
-		p.text = cat["label"]
-		p.toggle_mode = true
-		p.button_pressed = (cat["slug"] == "")
-		p.add_theme_font_size_override("font_size", 13)
-		p.pressed.connect(_on_pill.bind(cat["slug"], p))
-		_pill_row.add_child(p)
-	# Inline subcategory dropdown (right side) — folded into this row to save a
-	# whole row of vertical space. Only visible when the category has subcategories.
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_pill_row.add_child(spacer)
+	# Category tabs wrap onto extra lines (HFlowContainer): the library has 7+ top-level categories and
+	# one long row would stretch the whole dock wide.
+	_pill_flow = HFlowContainer.new()
+	_pill_flow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_pill_flow.add_theme_constant_override("h_separation", 4)
+	_pill_flow.add_theme_constant_override("v_separation", 4)
+	_pill_row.add_child(_pill_flow)
+	_top_cats = CghConfig.CATEGORIES.duplicate()   # fallback until the live list arrives
+	_fill_pills()
 	# Compact subcategory filter: a small icon button (fixed width) that opens a popup,
 	# instead of a wide dropdown whose longest label (e.g. "Muzzle Flashes") stretched
 	# the whole dock. Hidden for categories with no subcategories.
@@ -427,10 +442,26 @@ func _build_pills() -> HBoxContainer:
 	_populate_subcats("")
 	return _pill_row
 
+# (Re)build the category tab buttons from _top_cats, keeping the current selection pressed.
+func _fill_pills() -> void:
+	for old in _pills:
+		if is_instance_valid(old):
+			_pill_flow.remove_child(old)
+			old.queue_free()
+	_pills.clear()
+	for cat in _top_cats:
+		var p := Button.new()
+		p.text = cat["label"]
+		p.toggle_mode = true
+		p.button_pressed = (cat["slug"] == _category)
+		p.add_theme_font_size_override("font_size", 13)
+		p.pressed.connect(_on_pill.bind(cat["slug"], p))
+		_pill_flow.add_child(p)
+		_pills.append(p)
+
 func _on_pill(slug: String, btn: Button) -> void:
-	for c in _pill_row.get_children():
-		if c is Button:
-			c.button_pressed = (c == btn)
+	for c in _pills:
+		c.button_pressed = (c == btn)
 	_category = slug
 	_subcat = ""
 	_populate_subcats(slug)
@@ -460,15 +491,16 @@ func _populate_subcats(slug: String) -> void:
 	for i in pm.item_count:
 		pm.set_item_checked(i, i < _subcat_items.size() and _subcat_items[i] == _subcat)
 
-# Build the subcategory dropdown from the LIVE category list (Blender-style) so new
-# backend subcategories appear automatically. Non-fatal: until this arrives (or if it
-# fails) the hardcoded CghConfig.SUBCATEGORIES stays as the fallback.
+# Build the category TABS and the subcategory dropdowns from the LIVE category list, so every
+# top-level category the library has shows up (Explosions and Smoke live under VFX and VDBs; the
+# old hardcoded list of 3 tabs hid them) and new categories appear automatically. A category's parent
+# comes from the API's own parent_category relation, not from a hardcoded slug list. Non-fatal: until
+# this arrives (or if it fails) the hardcoded fallback tabs stay.
+const _PREFERRED_TABS := ["3d-models", "hdri", "flipbooks", "vfx", "vdbs", "texture", "shaders"]
+
 func _on_categories_loaded(cats: Array) -> void:
-	_subcats_by_parent.clear()
-	var usable := {}
-	for c in CghConfig.CATEGORIES:
-		if c["slug"] != "":
-			usable[c["slug"]] = true
+	var tops: Array = []
+	var kids := {}
 	var seen := {}
 	for item in cats:
 		if not (item is Dictionary):
@@ -476,35 +508,74 @@ func _on_categories_loaded(cats: Array) -> void:
 		var a = item.get("attributes", item)
 		if not (a is Dictionary):
 			a = item
-		var s := str(a.get("Slug", a.get("slug", ""))).strip_edges().to_lower()
-		if s == "" or usable.has(s):
-			continue                       # blank, or itself a top category
-		var parent := _parent_of(s)
-		if not usable.has(parent):
-			continue                       # not under a Godot-usable category
-		var key := parent + "/" + s
-		if seen.has(key):
-			continue
-		seen[key] = true
-		var nm := str(a.get("Name", a.get("name", a.get("Title", s))))
-		if not _subcats_by_parent.has(parent):
-			_subcats_by_parent[parent] = []
-		_subcats_by_parent[parent].append({"label": nm, "slug": s})
+		var slug := str(a.get("Slug", a.get("slug", ""))).strip_edges()
+		var label := str(a.get("Name", a.get("name", a.get("Title", slug)))).strip_edges()
+		var parent := _parent_slug_of(a)
+		if parent == "":
+			if slug == "" or seen.has(slug.to_lower()):
+				continue                    # a top-level tab needs a slug to filter on
+			seen[slug.to_lower()] = true
+			tops.append({"label": _tidy_label(label if label != "" else slug), "slug": slug, "ord": tops.size()})
+		else:
+			if slug == "" and label == "":
+				continue
+			# A child whose Slug is blank in the CMS can't be matched by slug: use its Name instead.
+			var key := slug if slug != "" else "name:" + label
+			if not kids.has(parent):
+				kids[parent] = []
+			kids[parent].append({"label": label if label != "" else slug, "slug": key})
+	if tops.is_empty():
+		return                         # nothing usable came back: keep the fallback tabs
+	tops.sort_custom(_tab_less)
+	for k in kids.keys():
+		kids[k].sort_custom(func(x, y): return str(x["label"]).naturalnocasecmp_to(str(y["label"])) < 0)
+	_subcats_by_parent = kids
+	var all_tabs: Array = [{"label": "All", "slug": ""}]
+	all_tabs.append_array(tops)
+	_top_cats = all_tabs
+	var selection_gone := false
+	if _category != "":
+		selection_gone = true
+		for t in tops:
+			if str(t["slug"]) == _category:
+				selection_gone = false
+	if selection_gone:
+		_category = ""
+		_subcat = ""
+	_fill_pills()
 	if _subcat_dd:
-		_populate_subcats(_category)       # refresh with the live data
+		_populate_subcats(_category)
+	if selection_gone:
+		_load_first_page()
 
-# Resolve a category slug's parent: our SUBCATEGORIES map first, then a suffix heuristic
-# so brand-new subcategories still nest under the right tab.
-func _parent_of(slug: String) -> String:
-	for parent in CghConfig.SUBCATEGORIES.keys():
-		for s in CghConfig.SUBCATEGORIES[parent]:
-			if str(s["slug"]).to_lower() == slug:
-				return parent
-	if slug.ends_with("-flipbooks"):
-		return "flipbooks"
-	if slug.ends_with("-hdr") or slug.ends_with("-hdri"):
-		return "hdri"
+# The API returns each category's parent as a relation; "" = it is a top-level category.
+func _parent_slug_of(a: Dictionary) -> String:
+	var pc = a.get("parent_category", null)
+	if pc is Dictionary:
+		var d = pc.get("data", pc)      # Strapi 5 returns the object itself; Strapi 4 nests it under data
+		if d is Dictionary:
+			var da = d.get("attributes", d)
+			if da is Dictionary:
+				return str(da.get("Slug", da.get("slug", ""))).strip_edges()
 	return ""
+
+# Tab order: the known categories first (in a fixed order), anything new after them in API order.
+func _tab_rank(slug: String) -> int:
+	var i := _PREFERRED_TABS.find(slug.to_lower())
+	return i if i >= 0 else 100
+
+func _tab_less(x: Dictionary, y: Dictionary) -> bool:
+	var rx := _tab_rank(str(x["slug"]))
+	var ry := _tab_rank(str(y["slug"]))
+	if rx != ry:
+		return rx < ry
+	return int(x["ord"]) < int(y["ord"])
+
+# "texture" -> "Texture"; leave already-styled names ("3D Models", "HDRI") alone.
+func _tidy_label(s: String) -> String:
+	if s == s.to_lower() and s.length() > 0:
+		return s.substr(0, 1).to_upper() + s.substr(1)
+	return s
 
 func _on_subcat_selected(id: int) -> void:
 	_subcat = str(_subcat_items[id]) if id >= 0 and id < _subcat_items.size() else ""
@@ -544,6 +615,7 @@ func _apply_search() -> void:
 		return
 	_search_text = q
 	if q != "":
+		CghAnalytics.note_action("search")
 		analytics.track("search_performed", {"query": q})
 	_load_first_page()
 
@@ -635,6 +707,16 @@ func _goto_page(p: int) -> void:
 		_scroll.scroll_vertical = 0
 	_fetch()
 
+# The tab itself PLUS its subcategories: many assets are filed straight under a subcategory
+# (e.g. "explosions-vfx"), so matching only the parent slug would miss them. [] = the All tab.
+func _tab_slugs() -> Array:
+	if _category == "":
+		return []
+	var out: Array = [_category]
+	for sc in _subcats_by_parent.get(_category, CghConfig.SUBCATEGORIES.get(_category, [])):
+		out.append(str(sc["slug"]))
+	return out
+
 # Cache key per (plan is handled by the cache) category/subcat/page/sort/search.
 func _cache_key() -> String:
 	return "%s|%s|%d|%s|%s" % [_category, _subcat, _page, _sort_param, _search_text]
@@ -653,7 +735,7 @@ func _fetch(force := false) -> void:
 	_set_status(("Searching “%s”…" % _search_text.strip_edges()) if _search_text.strip_edges() != "" else "Loading…", false)
 	# Pass category + subcategory separately: a subcategory filters the `subcategories`
 	# relation, a category filters `categorie` (different Strapi filters).
-	api.fetch_assets(_page, _page_size, _category, _search_text, _sort_param, _subcat)
+	api.fetch_assets(_page, _page_size, _category, _search_text, _sort_param, _subcat, _tab_slugs())
 
 func _on_assets_loaded(assets: Array, meta: Dictionary) -> void:
 	_loading = false
@@ -831,6 +913,9 @@ func _on_thumb(result: int, code: int, _h: PackedStringArray, body: PackedByteAr
 			# Network/decoder failure — surface the exact result/http in the panel
 			# (result=4 connection/offline, http=403/404 CDN, http=200 = decode issue).
 			_thumb_fail += 1
+			# One collapsed endpoint ("cdn:thumbnail") so a bad CDN day dedupes to ONE event, not one per image.
+			var thumb_ok_http := result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300
+			CghAnalytics.api_error("cdn:thumbnail", 0 if thumb_ok_http else code, "thumbnail decode failed" if thumb_ok_http else "thumbnail request failed (result %d)" % result, 0 if thumb_ok_http else result)
 			if _thumb_fail == 1:
 				_set_status("Thumbnail failed: result=%d http=%d (send me this)" % [result, code], true)
 			push_warning("CGHEVEN: thumbnail failed (result=%d http=%d) %s" % [result, code, str(ctx.get("url", ""))])
@@ -860,6 +945,7 @@ func _decode_image(body: PackedByteArray, _url: String) -> Image:
 
 # ----------------------------------------------------------------- download + import
 func _on_card_download(asset: Dictionary, entry: Dictionary) -> void:
+	CghAnalytics.note_action("download")
 	var e := entry if not entry.is_empty() else CghAsset.best_free_entry(asset)
 	if e.is_empty():
 		e = CghAsset.best_free_any(asset)   # nothing auto-importable, but still fetch the free file
@@ -917,6 +1003,7 @@ func _on_dl_finished(path: String) -> void:
 	var res := str(entry.get("res", ""))
 	# Record into the shared cross-addon manifest so AE/Premiere/DaVinci show the ✓ too.
 	CghDownloads.record(asset, path, fmt, res)
+	CghAnalytics.download_performance(_asset_props(asset), downloader.last_duration_ms, downloader.last_bytes, fmt, res)
 	if _dl_active and is_instance_valid(_dl_active["card"]):
 		_dl_active["card"].set_download_done(true)
 		# Re-evaluate the footer so it flips "Download" -> "Import" (and the ▾ rows update)
@@ -932,7 +1019,7 @@ func _on_dl_failed(message: String) -> void:
 	if _dl_active and is_instance_valid(_dl_active["card"]):
 		_dl_active["card"].set_download_done(false)
 	_report(message, false)
-	analytics.track("download_failed", _asset_props(asset, {"reason": message}))
+	CghAnalytics.download_failed(downloader.last_stage, message, downloader.last_status, downloader.last_result, _asset_props(asset), downloader.last_body)
 	_dl_active = null
 	_pump_queue()
 
@@ -941,6 +1028,7 @@ func _on_dl_failed(message: String) -> void:
 # with materials -> instance + select), which renders reliably; HDRI/flipbook use
 # the synchronous router (live-instanced into the open scene).
 func _route_import(path: String, asset: Dictionary) -> void:
+	CghAnalytics.note_action("import")
 	var cat := CghAsset.category_slug(asset)
 	var ext := path.get_extension().to_lower()
 	# 3D models arrive as a direct model file OR (usually) a .zip. Route BOTH through the
@@ -981,7 +1069,7 @@ func _route_import(path: String, asset: Dictionary) -> void:
 			return
 		msg = "This HDRI only ships in a compression Godot can't read yet — please try another HDRI (we're re-encoding these)."
 	_report(msg, ok)
-	_track_import_result(asset, ext, ok)
+	_track_import_result(asset, ext, ok, "router_" + cat, msg)
 
 # Lowest-res unlocked PNG/JPG/WebP entry for a flipbook — the fallback when its EXR sheet
 # won't load in Godot. Returns {} when the asset is EXR-only (no image variant to use).
@@ -1009,11 +1097,12 @@ func _hdri_loadable_alternative(asset: Dictionary, failed_path: String) -> Dicti
 
 # asset_imported on success / import_failed on failure — matches the AE/Premiere
 # events (the import path used to always report success, even when it failed).
-func _track_import_result(asset: Dictionary, fmt: String, ok: bool) -> void:
+func _track_import_result(asset: Dictionary, fmt: String, ok: bool, stage := "", reason := "") -> void:
 	if ok:
 		analytics.track("asset_imported", _asset_props(asset, {"format": fmt, "success": true}))
 	else:
-		analytics.track("import_failed", _asset_props(asset, {"format": fmt, "success": false}))
+		CghAnalytics.import_failed(stage if stage != "" else "import", reason if reason != "" else "import reported failure",
+			_asset_props(asset, {"format": fmt, "success": false}))
 
 # Copy the model under res://, let the editor import it, then instance the
 # PackedScene into the open scene and select it so the user can frame it (F).
@@ -1029,7 +1118,7 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 		res_path = CghImportRouter.copy_into_project(path, category)
 	if res_path == "":
 		_report("Couldn't copy the model into the project (check disk space / write permission).", false)
-		_track_import_result(asset, ext, false)
+		_track_import_result(asset, ext, false, "copy_to_project", "Couldn't copy the model into the project (disk space / write permission)")
 		return
 	_set_status("Importing 3D model…", false)
 	var efs := EditorInterface.get_resource_filesystem()
@@ -1064,7 +1153,7 @@ func _import_3d(path: String, asset: Dictionary, from_extract := false) -> void:
 		if imported_res == null:
 			# File exists in the project but never loaded — a failed/corrupt import.
 			_report("Couldn't import %s — the model file looks corrupt or uses an unsupported glTF feature. Delete the download and try another resolution." % res_path.get_file(), false)
-			_track_import_result(asset, ext, false)
+			_track_import_result(asset, ext, false, "editor_import", "model failed to load after editor import (corrupt file or unsupported glTF feature)")
 		else:
 			# Imported, but not an auto-instanceable scene/mesh — leave it in the dock.
 			_report("Model saved to %s — drag it from FileSystem into your scene." % res_path, true)
@@ -1253,6 +1342,28 @@ func _on_plan_refreshed(plan: String) -> void:
 	_refresh_account_ui()
 	_set_status("Plan updated: %s" % plan, false)
 	_load_first_page(true)   # force: access changed -> re-fetch instead of serving a stale page
+
+# Server said the session is dead (401/402/403 on assets/categories): sign out, then explain.
+func _on_auth_rejected(code: int, message: String) -> void:
+	auth.end_session(code, message)
+
+# Heartbeat renewed the 24h token: just hand the fresh token to the API client.
+func _on_session_refreshed() -> void:
+	api.set_session_token(auth.session_token)
+
+# The user was signed out by the server (expired / revoked / used on another device).
+# Say why, then reload as a guest so the grid is usable instead of stuck on errors.
+func _on_session_expired(reason: String) -> void:
+	api.set_session_token("")
+	analytics.identify("", "Free")
+	_refresh_account_ui()
+	_set_status(reason, true)
+	_show_toast(reason, "error")
+	api.fetch_categories()
+	_load_first_page(true)
+
+func _sweep_temp_extractions() -> void:
+	CghDownloads.clean_temp_extractions()
 
 func _refresh_account_ui() -> void:
 	_login_btn.text = "👤 Account" if auth.is_logged_in() else "Login"

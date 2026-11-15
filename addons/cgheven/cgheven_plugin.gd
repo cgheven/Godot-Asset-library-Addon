@@ -12,8 +12,12 @@ var _analytics: CghAnalytics
 var _updater: CghUpdater
 var _theme: Theme
 var _heartbeat: Timer
+var _export_filter: EditorExportPlugin
 
 func _enter_tree() -> void:
+	# Keep download baggage (video, archives, optional source copies) out of exported games.
+	_export_filter = preload("res://addons/cgheven/core/export_filter.gd").new()
+	add_export_plugin(_export_filter)
 	_theme = CghTheme.build()
 
 	# core services (must be in the editor tree for HTTPRequest to work)
@@ -54,6 +58,10 @@ func _enter_tree() -> void:
 	_dock.add_child(_heartbeat)
 
 func _exit_tree() -> void:
+	if _export_filter:
+		remove_export_plugin(_export_filter)
+		_export_filter = null
+	CghAnalytics.session_ended()   # one best-effort event: session length + error count
 	if _dock:
 		remove_control_from_docks(_dock)
 		_dock.queue_free()

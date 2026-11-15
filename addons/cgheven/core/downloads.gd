@@ -55,6 +55,45 @@ static func _write_manifest(arr: Array) -> void:
 		f.store_string(JSON.stringify(arr))
 		f.close()
 
+## Removes "<name>_unzip" folders left next to downloaded zips by earlier imports. They are
+## throw-away extraction caches (always re-extracted on demand), but each holds the FULL unpacked
+## archive (often hundreds of MB of 4K files) and was never cleaned up. Only folders that sit next
+## to a "<name>.zip" are touched, so nothing else in the downloads folder is ever deleted.
+static func clean_temp_extractions() -> void:
+	var dir := CghConfig.primary_download_dir()
+	var da := DirAccess.open(dir)
+	if da == null:
+		return
+	var doomed: Array = []
+	da.list_dir_begin()
+	var entry := da.get_next()
+	while entry != "":
+		if da.current_is_dir() and entry.ends_with("_unzip") and \
+				FileAccess.file_exists(dir.path_join(entry.trim_suffix("_unzip") + ".zip")):
+			doomed.append(dir.path_join(entry))
+		entry = da.get_next()
+	da.list_dir_end()
+	for d in doomed:
+		_remove_tree(d)
+
+static func _remove_tree(path: String) -> void:
+	var da := DirAccess.open(path)
+	if da == null:
+		return
+	var kids: Array = []
+	da.list_dir_begin()
+	var e := da.get_next()
+	while e != "":
+		kids.append([path.path_join(e), da.current_is_dir()])
+		e = da.get_next()
+	da.list_dir_end()
+	for k in kids:
+		if k[1]:
+			_remove_tree(k[0])
+		else:
+			DirAccess.remove_absolute(k[0])
+	DirAccess.remove_absolute(path)
+
 static func rescan() -> void:
 	_names.clear()
 	_ids.clear()

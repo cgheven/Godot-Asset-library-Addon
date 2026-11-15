@@ -6,7 +6,9 @@ class_name CghCache
 
 # Bump this when the asset query changes shape (e.g. the "All" tab now excludes
 # vfx/vdbs) — old cache files have a different prefix and are simply ignored.
-const ASSET_CACHE_VERSION := "v2"
+# v3: the "All" tab no longer uses a hard-coded 3-category whitelist (it showed 172 of 841 assets),
+# so pages cached by older versions are ignored.
+const ASSET_CACHE_VERSION := "v3"
 
 static func _asset_cache_path(plan: String, key: String) -> String:
 	return "%s/assets_%s_%s_%s.json" % [CghConfig.CACHE_DIR, ASSET_CACHE_VERSION, plan, key.sha256_text().substr(0, 12)]
