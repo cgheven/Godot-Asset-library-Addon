@@ -24,6 +24,10 @@ var _banner: PanelContainer
 var _banner_dismissed := false
 var _status: Label
 var _login_btn: Button
+var _coll_open := false                # the Collections tab (last category pill) is showing
+var _coll_pill: Button
+var _coll_page: CghCollectionsPage
+var _browse_nodes: Array = []          # hidden while the Collections page is open
 var _pill_row: HBoxContainer
 var _thumb_http: Array[HTTPRequest] = []
 var _settings: CghSettingsModal
@@ -163,8 +167,10 @@ func _build_ui() -> void:
 	root.add_child(_build_toast())           # prominent success/failure bar at the very top
 	root.add_child(_build_topnav())
 	root.add_child(_build_banner())
-	root.add_child(_build_searchrow())
-	root.add_child(_build_pills())          # category pills + inline subcategory dropdown
+	var searchrow := _build_searchrow()
+	root.add_child(searchrow)
+	var pills := _build_pills()
+	root.add_child(pills)                   # category pills + inline subcategory dropdown
 
 	# Status line takes no space unless there's actually a message. It MUST wrap +
 	# clip — a long one-liner (e.g. an import path) would otherwise grow the dock's
@@ -183,6 +189,14 @@ func _build_ui() -> void:
 	_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	root.add_child(_scroll)
+	_browse_nodes = [searchrow, _status, _scroll]   # hidden on the Collections tab (the category tabs stay)
+
+	# Collections page (bought / claimed with Studio / locked): replaces the library while its nav button is on.
+	_coll_page = CghCollectionsPage.new()
+	_coll_page.auth = auth
+	_coll_page.visible = false
+	_coll_page.notify.connect(func(msg: String, ok: bool): _show_toast(msg, "success" if ok else "error"))
+	root.add_child(_coll_page)
 
 	# grid + page numbers live INSIDE the scroll; the page bar sits at the bottom
 	# after the cards (1 2 3 … instead of an infinite "Load More").
@@ -250,6 +264,33 @@ func _build_topnav() -> HBoxContainer:
 	refresh.pressed.connect(_hard_refresh)
 	nav.add_child(refresh)
 	return nav
+
+# Login / plan changed: the collections list must be loaded again (right away when the page is open).
+func _collections_changed() -> void:
+	if _coll_page != null:
+		_coll_page.invalidate()
+		if _coll_page.visible:
+			_coll_page.enter()
+
+# Switch between the asset library and the Collections page.
+func _on_collections_pill() -> void:
+	for c in _pills:
+		c.button_pressed = (c == _coll_pill)
+	_set_collections_open(true)
+
+func _set_collections_open(on: bool) -> void:
+	_coll_open = on
+	for n in _browse_nodes:
+		if is_instance_valid(n):
+			n.visible = (not on) if n != _status else (not on and _status.text != "")
+	if _subcat_dd != null:
+		_subcat_dd.visible = not on and not _subcat_items.is_empty()
+	if _coll_page != null:
+		_coll_page.visible = on
+		if on:
+			_coll_page.enter()
+	if on:
+		analytics.track("category_clicked", {"category": "collections"})
 
 # Prominent top toast (auto-hides). Green ✓ = success, red ✗ = failure, accent ℹ = info.
 # Lives at the top of the panel so download/import outcomes are impossible to miss.
@@ -468,10 +509,22 @@ func _fill_pills() -> void:
 		p.pressed.connect(_on_pill.bind(cat["slug"], p))
 		_pill_flow.add_child(p)
 		_pills.append(p)
+	# Collections is the last tab: bought / claimed / locked collections instead of single assets.
+	_coll_pill = Button.new()
+	_coll_pill.text = "Collections"
+	_coll_pill.toggle_mode = true
+	_coll_pill.button_pressed = _coll_open
+	_coll_pill.add_theme_font_size_override("font_size", 13)
+	_coll_pill.tooltip_text = "Collections you bought, claimed with Studio, or can buy"
+	_coll_pill.pressed.connect(_on_collections_pill)
+	_pill_flow.add_child(_coll_pill)
+	_pills.append(_coll_pill)
 
 func _on_pill(slug: String, btn: Button) -> void:
 	for c in _pills:
 		c.button_pressed = (c == btn)
+	if _coll_open:
+		_set_collections_open(false)
 	_category = slug
 	_subcat = ""
 	_populate_subcats(slug)
@@ -1387,6 +1440,7 @@ func _do_logout() -> void:
 	_load_first_page(true)   # force: the grid is cached per-plan, so a plan change must refetch
 
 func _on_logged_in(plan: String) -> void:
+	_collections_changed()
 	api.set_session_token(auth.session_token)
 	analytics.identify(auth.email, plan)
 	analytics.track("account_login")
@@ -1397,6 +1451,7 @@ func _on_logged_in(plan: String) -> void:
 	_load_first_page(true)
 
 func _on_plan_refreshed(plan: String) -> void:
+	_collections_changed()
 	api.set_session_token(auth.session_token)
 	_refresh_account_ui()
 	_set_status("Plan updated: %s" % plan, false)
@@ -1413,6 +1468,7 @@ func _on_session_refreshed() -> void:
 # The user was signed out by the server (expired / revoked / used on another device).
 # Say why, then reload as a guest so the grid is usable instead of stuck on errors.
 func _on_session_expired(reason: String) -> void:
+	_collections_changed()
 	api.set_session_token("")
 	analytics.identify("", "Free")
 	_refresh_account_ui()
