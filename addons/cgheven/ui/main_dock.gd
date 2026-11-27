@@ -21,7 +21,8 @@ var _free: OptionButton
 var _filter_mode := 0   # 0 = all, 1 = free only, 2 = downloaded only
 var _manual_check := false
 var _banner: PanelContainer
-var _banner_dismissed := false
+var _campaign: RefCounted = null   # banner + popup, see ui/campaign.gd
+const _Campaign := preload("res://addons/cgheven/ui/campaign.gd")
 var _status: Label
 var _login_btn: Button
 var _coll_open := false                # the Collections tab (last category pill) is showing
@@ -368,56 +369,17 @@ func _build_banner() -> PanelContainer:
 	_banner.visible = false
 	return _banner
 
+# Banner (one line) and popup are decided in the admin; drawing and rules are in ui/campaign.gd.
 func _render_banner(meta: Dictionary) -> void:
 	if _banner == null:
 		return
-	for c in _banner.get_children():
-		_banner.remove_child(c)
-		c.queue_free()
-	var b = meta.get("banner", {})
-	if not (b is Dictionary) or not b.get("enabled", false) or _banner_dismissed:
-		_banner.visible = false
-		return
-	var title := str(b.get("title", ""))
-	var message := str(b.get("message", ""))
-	if title == "" and message == "":
-		_banner.visible = false
-		return
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 8)
-	_banner.add_child(row)
-	var texts := VBoxContainer.new()
-	texts.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	texts.add_theme_constant_override("separation", 1)
-	row.add_child(texts)
-	if title != "":
-		var tl := Label.new()
-		tl.text = title
-		tl.add_theme_color_override("font_color", Color.WHITE)
-		tl.add_theme_font_size_override("font_size", 12)
-		texts.add_child(tl)
-	if message != "":
-		var ml := Label.new()
-		ml.text = message
-		ml.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		ml.add_theme_color_override("font_color", Color(1, 1, 1, 0.9))
-		ml.add_theme_font_size_override("font_size", 11)
-		texts.add_child(ml)
-	var btn = b.get("button", {})
-	if btn is Dictionary and str(btn.get("url", "")) != "":
-		var ab := Button.new()
-		ab.text = str(btn.get("label", "Learn more"))
-		ab.add_theme_color_override("font_color", Color.WHITE)
-		var url := str(btn.get("url", ""))
-		ab.pressed.connect(func(): CghConfig.open_url_safe(url))
-		row.add_child(ab)
-	var x := Button.new()
-	x.flat = true
-	x.text = "✕"
-	x.add_theme_color_override("font_color", Color.WHITE)
-	x.pressed.connect(func(): _banner_dismissed = true; _banner.visible = false)
-	row.add_child(x)
-	_banner.visible = true
+	if _campaign == null:
+		_campaign = _Campaign.new()
+		_campaign.setup(self,
+			func(event: String, props: Dictionary): analytics.track(event, props),
+			func() -> bool: return _dl_active != null or not _dl_queue.is_empty())
+	_campaign.render_banner(_banner, meta)
+	_campaign.schedule_popup(meta)
 
 func _build_searchrow() -> HBoxContainer:
 	var row := HBoxContainer.new()
