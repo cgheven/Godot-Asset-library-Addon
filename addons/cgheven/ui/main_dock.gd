@@ -22,6 +22,8 @@ var _filter_mode := 0   # 0 = all, 1 = free only, 2 = downloaded only
 var _manual_check := false
 var _banner: PanelContainer
 var _campaign: RefCounted = null   # banner + popup, see ui/campaign.gd
+var _campaign_meta := {}            # from the server in THIS session (saved asset pages are old)
+var _campaign_asked := false
 const _Campaign := preload("res://addons/cgheven/ui/campaign.gd")
 var _status: Label
 var _login_btn: Button
@@ -370,7 +372,7 @@ func _build_banner() -> PanelContainer:
 	return _banner
 
 # Banner (one line) and popup are decided in the admin; drawing and rules are in ui/campaign.gd.
-func _render_banner(meta: Dictionary) -> void:
+func _render_banner(_saved_meta: Dictionary) -> void:
 	if _banner == null:
 		return
 	if _campaign == null:
@@ -378,8 +380,33 @@ func _render_banner(meta: Dictionary) -> void:
 		_campaign.setup(self,
 			func(event: String, props: Dictionary): analytics.track(event, props),
 			func() -> bool: return _dl_active != null or not _dl_queue.is_empty())
-	_campaign.render_banner(_banner, meta)
-	_campaign.schedule_popup(meta)
+	# A page shown from the cache carries an old banner (or none), so the server is asked once per session.
+	if not _campaign_asked:
+		_campaign_asked = true
+		_fetch_campaign()
+	if _campaign_meta.is_empty():
+		return
+	_campaign.render_banner(_banner, _campaign_meta)
+	_campaign.schedule_popup(_campaign_meta)
+
+func _fetch_campaign() -> void:
+	var base := CghConfig.authed_assets_url() if api._session_token != "" else CghConfig.public_assets_url()
+	var url := base + "?addonSlug=%s&pagination[page]=1&pagination[pageSize]=1" % CghConfig.ADDON_SLUG
+	var http := HTTPRequest.new()
+	http.timeout = 20.0
+	add_child(http)
+	http.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray):
+		http.queue_free()
+		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+			_campaign_asked = false   # ask again with the next page
+			return
+		var parsed = JSON.parse_string(body.get_string_from_utf8())
+		if parsed is Dictionary and parsed.get("meta") is Dictionary:
+			_campaign_meta = parsed["meta"]
+			_render_banner(_campaign_meta))
+	if http.request(url, api._headers()) != OK:
+		http.queue_free()
+		_campaign_asked = false
 
 func _build_searchrow() -> HBoxContainer:
 	var row := HBoxContainer.new()
@@ -788,6 +815,8 @@ func _on_assets_loaded(assets: Array, meta: Dictionary) -> void:
 	if _filter_mode == 3:   # Favorites view doesn't use fetched results
 		return
 	CghCache.save_assets(auth.plan, _cache_key(), assets, meta)
+	_campaign_meta = meta        # fresh from the server
+	_campaign_asked = true
 	_render_assets(assets, meta)
 
 func _render_assets(assets: Array, meta: Dictionary) -> void:

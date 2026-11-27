@@ -142,8 +142,6 @@ func render_banner(panel: PanelContainer, meta: Dictionary) -> void:
 			l.clip_text = true
 			l.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 			l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			l.tooltip_text = l.text
-			l.mouse_filter = Control.MOUSE_FILTER_PASS
 			parts[item[0]] = l
 			row.add_child(l)
 	if not parts.has("title") and not parts.has("message"):
@@ -156,14 +154,18 @@ func render_banner(panel: PanelContainer, meta: Dictionary) -> void:
 		var ends := _label("", _GOLD, 11)
 		parts["ends"] = ends
 		row.add_child(ends)
+		var paint := func():
+			var left := _ends_in(until)
+			if ends.get_meta("short", false):
+				left = " ".join(left.split(" ").slice(0, 3))
+			ends.text = (("Ends in " if ends.get_meta("prefix", false) else "") + left) if left != "" else ""
+		parts["paint"] = paint
 		var timer := Timer.new()
 		timer.wait_time = 1.0
 		timer.autostart = true
-		timer.timeout.connect(func():
-			var left := _ends_in(until)
-			ends.text = (("Ends in " if row.size.x >= 430 else "") + left) if left != "" else "")
+		timer.timeout.connect(paint)
 		row.add_child(timer)
-		ends.text = _ends_in(until)
+		paint.call()
 
 	var button_label := _s(b, "button_label")
 	var url := _s(b, "button_url")
@@ -172,36 +174,76 @@ func render_banner(panel: PanelContainer, meta: Dictionary) -> void:
 		cta.pressed.connect(func():
 			_report("addon_banner_clicked", b, {"button": button_label})
 			CghConfig.open_url_safe(url))
+		parts["cta"] = cta
 		row.add_child(cta)
 	var x := _button("✕", Color.TRANSPARENT, Color("c9c9ce"))
 	x.pressed.connect(func():
 		_remember(key, {"bannerClosed": _today()})
 		_report("addon_banner_closed", b)
 		panel.visible = false)
+	parts["x"] = x
 	row.add_child(x)
 
-	row.resized.connect(_fit.bind(row, parts))
-	panel.add_child(row)
+	# A plain Control around the row: its width never comes from the row, so a long banner
+	# can never push the dock wider than it is.
+	var holder := Control.new()
+	holder.clip_contents = true
+	holder.mouse_filter = Control.MOUSE_FILTER_PASS
+	holder.tooltip_text = (_s(b, "title") + "  " + _s(b, "message")).strip_edges()
+	holder.add_child(row)
+	row.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	holder.resized.connect(_fit.bind(holder, parts))
+	panel.add_child(holder)
+	holder.custom_minimum_size.y = row.get_combined_minimum_size().y
 	panel.visible = true
+	_fit.call_deferred(holder, parts)
 	# "shown" is counted once a day per event, however often the grid reloads.
 	if str(_read(key).get("bannerSeen", "")) != _today():
 		_remember(key, {"bannerSeen": _today()})
 		_report("addon_banner_shown", b)
 
-## Narrow docks drop the least important parts first.
-func _fit(row: HBoxContainer, parts: Dictionary) -> void:
-	var width := row.size.x
+## Order of importance: close, button, title (cut with "..."), countdown, badge, message.
+func _fit(holder: Control, parts: Dictionary) -> void:
+	if not is_instance_valid(holder) or holder.size.x <= 0.0:
+		return
+	var avail := holder.size.x
+	var gap := 8.0
+	var room := avail
+	for k in ["x", "cta"]:
+		if parts.has(k):
+			room -= parts[k].get_combined_minimum_size().x + gap
+	var natural := 0.0
+	if parts.has("title"):
+		var t: Label = parts["title"]
+		natural = t.get_theme_font("font").get_string_size(t.text, HORIZONTAL_ALIGNMENT_LEFT, -1, 12).x + 4.0
+		room -= minf(natural, 80.0) + gap
+	if parts.has("ends"):
+		var ends: Label = parts["ends"]
+		var prefix := avail >= 520.0 and room >= 170.0
+		var short := not prefix and room < 115.0
+		ends.set_meta("prefix", prefix)
+		ends.set_meta("short", short)
+		ends.visible = room >= 70.0
+		parts["paint"].call()
+		if ends.visible:
+			room -= (165.0 if prefix else (65.0 if short else 110.0)) + gap
 	if parts.has("badge"):
-		parts["badge"].visible = width >= 340
+		var badge: Control = parts["badge"]
+		var need := badge.get_combined_minimum_size().x + gap
+		badge.visible = room >= need
+		if badge.visible:
+			room -= need
+	# The title takes what is free up to its own width, then the message gets the rest.
+	var show_message := false
 	if parts.has("message"):
-		parts["message"].visible = width >= 640
+		var spare := room - maxf(natural - 80.0, 0.0)
+		show_message = spare >= 100.0
+		parts["message"].visible = show_message
 	if parts.has("title"):
 		var title: Label = parts["title"]
-		if parts.has("message") and width >= 640:
-			# The title takes its own width, the message the free space.
-			var natural := title.get_theme_font("font").get_string_size(title.text, HORIZONTAL_ALIGNMENT_LEFT, -1, 12).x
+		if show_message:
 			title.size_flags_horizontal = Control.SIZE_FILL
-			title.custom_minimum_size.x = minf(natural + 4.0, width / 3.0)
+			title.custom_minimum_size.x = natural
 		else:
 			title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 			title.custom_minimum_size.x = 0.0
